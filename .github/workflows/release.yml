@@ -5,172 +5,103 @@ on:
       - 'v*.*.*'
 
 jobs:
-  release_assets:
-    name: release_assets
-    runs-on: ubuntu-22.04
+  build:
+    strategy:
+      matrix:
+        include:
+          - image: ubuntu-24.04
+            arch: x86_64
+            ubuntu: ubuntu2404
+          - image: ubuntu-24.04-arm
+            arch: aarch64
+            ubuntu: ubuntu2404
+          - image: ubuntu-26.04
+            arch: x86_64
+            ubuntu: ubuntu2604
+          - image: ubuntu-26.04-arm
+            arch: aarch64
+            ubuntu: ubuntu2604
+    runs-on: ${{ matrix.image }}
     if: startsWith(github.ref, 'refs/tags/')
-
     steps:
-      - uses: actions/checkout@v4
-      - run: git fetch --prune --unshallow --tags --force
-
-      - name: Check if release is needed because tag matches latest annotated
-        env:
-          GITHUB_REF: ${{github.ref}}
-        run: |
-          GETVERSION="$(./scripts/get-version)"
-          GITTAG="${GITHUB_REF#refs/tags/v*}"
-          if [ "$GETVERSION" == "$GITTAG" ]
-          then
-            echo "do_release=true" >> $GITHUB_ENV
-          else
-            echo "Skipping because $GETVERSION did not match $GITTAG"
-          fi
-
-      - name: Make dist tarball and rpm packages
-        if: env.do_release
-        env:
-          OS_TYPE: rockylinux
-          OS_VERSION: 8
-          HIDE_DIST: true
-          GO_ARCH: linux-amd64
-        run: |
-          # Move the source directory down a level to separate it
-          #  from later builds; the docker build runs privileged and
-          #  changes the ownership of the files.
-          set -x
-          mkdir rpmdir
-          shopt -s extglob
-          mv .??* !(rpmdir) rpmdir
-          cd rpmdir
-          ./scripts/ci-docker-run
-          cp *.tar.gz *.rpm ..
-          cd ..
-
-      - name: Make el10 rpm packages
-        if: env.do_release
-        env:
-          OS_TYPE: rockylinux/rockylinux
-          OS_VERSION: 10
-          BUILD_TYPE: rebuild-rpm
-          GO_ARCH: linux-amd64
-        run: |
-          # Make a new copy of the source files for this build
-          set -x
-          tar xf apptainer-*.tar.gz
-          cd `basename apptainer-*.tar.gz .tar.gz`
-          cp ../apptainer-*.tar.gz .
-          ./scripts/ci-docker-run
-          cp $(ls *.rpm|grep -v src.rpm) ..
-          cd ..
-
-      - name: Make standard deb packages
-        if: env.do_release
-        env:
-          OS_TYPE: debian
-          OS_VERSION: 12
-          GO_ARCH: linux-amd64
-        run: |
-          # Make another new copy of the source files for this build
-          set -x
-          sudo rm -rf `basename apptainer-*.tar.gz .tar.gz`
-          tar xf apptainer-*.tar.gz
-          cd `basename apptainer-*.tar.gz .tar.gz`
-          ./scripts/ci-docker-run
-          cp *.deb ..
-          cd ..
-
-      - name: Make trixie deb packages
-        if: env.do_release
-        env:
-          OS_TYPE: debian
-          OS_VERSION: 13
-          GO_ARCH: linux-amd64
-        run: |
-          # Make another new copy of the source files for this build
-          set -x
-          sudo rm -rf `basename apptainer-*.tar.gz .tar.gz`
-          tar xf apptainer-*.tar.gz
-          cd `basename apptainer-*.tar.gz .tar.gz`
-          ./scripts/ci-docker-run
-          for d in *.deb; do cp $d ../`echo $d|sed 's/\(_[^_]*$\)/-trixie+\1/'`; done
-          cd ..
-
-      - name: Release
-        if: env.do_release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            *.tar.gz
-            *.rpm
-            *.deb
-
-  release_container_images:
-    name: release_container_images
-    runs-on: ubuntu-22.04
-    if: startsWith(github.ref, 'refs/tags/')
-
+    - name: stop update man-page
+      run: |
+        echo "set man-db/auto-update false" | sudo debconf-communicate
+        sudo dpkg-reconfigure man-db
+    - uses: actions/checkout@v7
+      with:
+        repository: 'wx257osn2/apptainer-proot'
+        ref: ${{ github.ref_name }}
+    - name: build
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libseccomp-dev libtalloc-dev libattr1-dev libprotobuf-c-dev libfuse3-dev zlib1g-dev liblzo2-dev liblz4-dev liblzma-dev libzstd-dev uuid-dev autoconf automake libtool pkg-config curl zstd patch
+        ./mconfig -p /opt/apptainer --without-suid
+        pushd ./builddir
+        make -j $(nproc)
+        make install
+        popd
+        mkdir -p deps
+        ./scripts/download-dependencies ./deps
+        rm ./deps/e2fsprogs*.tar.gz
+        mkdir -p ./deps/e2fsprogs-e4f17380b2e5
+        curl -fsSL https://github.com/wx257osn2/tytso-e2fsprogs/archive/e4f17380b2e5b8356ab9806689f780d386ce8e3e.tar.gz | tar -xz -C "./deps/e2fsprogs-e4f17380b2e5" --strip-component=1
+        tar -czf "./deps/e2fsprogs-e4f17380b2e5.tar.gz" -C "./deps" "e2fsprogs-e4f17380b2e5"
+        rm -r "./deps/e2fsprogs-e4f17380b2e5"
+        pushd deps
+        ../scripts/compile-dependencies .
+        ../scripts/install-dependencies /opt/apptainer/libexec
+        popd
+        tar -C /opt -cf ./${{ matrix.ubuntu }}-${{ matrix.arch }}.tar.zst --use-compress-program="zstdmt -18" apptainer
+    - uses: actions/upload-artifact@v7
+      with:
+        name: archive-${{ matrix.ubuntu }}-${{ matrix.arch }}
+        path: ./${{ matrix.ubuntu }}-${{ matrix.arch }}.tar.zst
+  deploy:
+    runs-on: ubuntu-slim
+    needs: build
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-        # Using "with: fetch-depth: 0" instead of the below sometimes results
-        # in it not recognizing the release tag.
-        run: git fetch --prune --unshallow --tags --force
-
-      - name: Check if release is needed because tag matches latest annotated
-        env:
-          GITHUB_REF: ${{github.ref}}
-        run: |
-          GETVERSION="$(./scripts/get-version)"
-          GITTAG="${GITHUB_REF#refs/tags/v*}"
-          if [ "$GETVERSION" == "$GITTAG" ]
-          then
-            echo "do_release=true" >> $GITHUB_ENV
-            echo "git_tag=$GITTAG" >> $GITHUB_ENV
-          else
-            echo "Skipping because $GETVERSION did not match $GITTAG"
-          fi
-
-      - name: Set up qemu
-        if: env.do_release
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        if: env.do_release
-        uses: docker/setup-buildx-action@v3
-
-      - name: Docker meta
-        if: env.do_release
-        id: meta
-        uses: docker/metadata-action@v5
+    - run: |
+        version=$(echo ${{ github.ref }} | sed 's@refs/tags/@@g')
+        echo "apptainer_version=${version}" >> $GITHUB_ENV
+    - parallel:
+      - uses: actions/download-artifact@v8
         with:
-          images: ghcr.io/apptainer/apptainer
-          tags: |
-            type=semver,pattern={{version}}
-
-      - name: Login to ghcr.io
-        if: env.do_release
-        uses: docker/login-action@v3
+          name: archive-ubuntu2404-x86_64
+      - uses: actions/download-artifact@v8
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Get golang version
-        id: min-go-version
-        run: echo "GOLANG_VERSION=$(scripts/get-min-go-version)" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push
-        if: env.do_release
-        uses: docker/build-push-action@v5
+          name: archive-ubuntu2404-aarch64
+      - uses: actions/download-artifact@v8
         with:
-          context: .
-          push: ${{ github.event_name != 'push tag' }}
-          file: dist/docker/Dockerfile
-          build-args: |
-            VERSION=${{ env.git_tag }}
-            GOLANG_VERSION=${{ steps.min-go-version.outputs.GOLANG_VERSION }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          platforms: linux/amd64,linux/arm64
+          name: archive-ubuntu2604-x86_64
+      - uses: actions/download-artifact@v8
+        with:
+          name: archive-ubuntu2604-aarch64
+      - run: |
+          cat << 'EOF' > install.bash
+          #!/bin/bash
+          set -euxo pipefail
+          curl -sSL https://github.com/wx257osn2/apptainer-proot/releases/download/${{ env.apptainer_version }}/ubuntu$(bash -c 'source /etc/os-release; echo ${VERSION_ID//./}')-$(uname -m).tar.zst | tar -C ${1:-"${HOME}/.local"} -x --use-compress-program="pzstd"
+          EOF
+      - run: |
+          cat << 'EOF' > release_notes
+          ```
+          $ which tar
+          $ which curl
+          $ which pzstd
+          $ curl -sSL https://github.com/wx257osn2/apptainer-proot/releases/download/${{ env.apptainer_version }}/install.bash | bash -s -- /path/to
+          $ /path/to/apptainer/bin/apptainer --version
+          ```
+          EOF
+    - uses: softprops/action-gh-release@v3
+      with:
+        files: |
+          ubuntu2404-x86_64.tar.zst
+          ubuntu2404-aarch64.tar.zst
+          ubuntu2604-x86_64.tar.zst
+          ubuntu2604-aarch64.tar.zst
+          install.bash
+        body_path: release_notes
