@@ -294,6 +294,15 @@ var writeLocks = make(map[string][]Section)
 // readLocks tracks read locks for the current process.
 var readLocks = make(map[string][]Section)
 
+// ResetLockTracking forgets the sections locked by the current process.
+// It must only be called once the process closed all the images it opened,
+// which released their locks, like before starting a container from the
+// same process.
+func ResetLockTracking() {
+	clear(writeLocks)
+	clear(readLocks)
+}
+
 // lockSection puts a file byte-range lock on a section to prevent
 // from concurrent writes depending if the image is writable or
 // not. If the image is writable, calling this function will place

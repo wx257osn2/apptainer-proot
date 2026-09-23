@@ -319,6 +319,7 @@ fi
 %dir %{_libexecdir}/%{name}
 %dir %{_libexecdir}/%{name}/bin
 %{_libexecdir}/%{name}/bin/starter
+%{_libexecdir}/%{name}/bin/proot-init
 %if "%{?gocryptfs_version}" != ""
 %{_libexecdir}/%{name}/bin/gocryptfs
 %endif

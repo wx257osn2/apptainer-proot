@@ -84,6 +84,9 @@ func (s *stage) runHostScript(name string, script types.Script) error {
 func (s *stage) runPostScript(sessionResolv, sessionHosts string) error {
 	if s.b.Recipe.BuildData.Post.Script != "" {
 		cmdArgs := []string{"--build-config", "exec", "--pwd", "/", "--writable"}
+		if s.b.Opts.Proot {
+			cmdArgs = append(cmdArgs, "--proot", "--fakeroot")
+		}
 		cmdArgs = append(cmdArgs, "--cleanenv", "--env", aEnvironment, "--env", sEnvironment, "--env", aLabels, "--env", sLabels)
 
 		if sessionResolv != "" {
@@ -153,6 +156,9 @@ func (s *stage) runPostScript(sessionResolv, sessionHosts string) error {
 func (s *stage) runTestScript(sessionResolv, sessionHosts string) error {
 	if !s.b.Opts.NoTest && s.b.Recipe.BuildData.Test.Script != "" {
 		cmdArgs := []string{"-s", "--build-config", "test", "--pwd", "/"}
+		if s.b.Opts.Proot {
+			cmdArgs = append(cmdArgs, "--proot")
+		}
 
 		if sessionResolv != "" {
 			cmdArgs = append(cmdArgs, "-B", sessionResolv+":/etc/resolv.conf")

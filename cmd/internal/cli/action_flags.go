@@ -92,6 +92,8 @@ var (
 	ignoreFakerootCmd bool
 	ignoreUserns      bool
 
+	useProot bool // whether running under proot instead of namespaces
+
 	underlay bool // whether using underlay instead of overlay
 
 	shareNS bool // mode for launching container using shared namespace
@@ -834,6 +836,16 @@ var actionIgnoreUsernsFlag = cmdline.Flag{
 	Hidden:       true,
 }
 
+// --proot
+var actionProotFlag = cmdline.Flag{
+	ID:           "actionProotFlag",
+	Value:        &useProot,
+	DefaultValue: false,
+	Name:         "proot",
+	Usage:        "run container under proot without any namespace",
+	EnvKeys:      []string{"PROOT"},
+}
+
 // --underlay (deprecated)
 var actionUnderlayFlag = cmdline.Flag{
 	ID:           "underlayFlag",
@@ -1005,6 +1017,7 @@ func init() {
 		cmdManager.RegisterFlagForCmd(&actionIgnoreUsernsFlag, actionsInstanceCmd...)
 		cmdManager.RegisterFlagForCmd(&actionUnderlayFlag, actionsInstanceCmd...)
 		cmdManager.RegisterFlagForCmd(&actionShareNSFlag, actionsCmd...)
+		cmdManager.RegisterFlagForCmd(&actionProotFlag, actionsCmd...)
 		cmdManager.RegisterFlagForCmd(&commonAuthFileFlag, actionsInstanceCmd...)
 		cmdManager.RegisterFlagForCmd(&actionRunscriptTimeoutFlag, actionsRunscriptCmd...)
 		cmdManager.RegisterFlagForCmd(&actionIntelHpuFlag, actionsInstanceCmd...)

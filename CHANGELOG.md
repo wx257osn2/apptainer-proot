@@ -9,6 +9,25 @@ For older changes see the [archived Singularity change log](https://github.com/a
 
 Changes since 1.5.x
 
+- Add a proot runtime which runs containers of unprivileged users without
+  any namespace, under the bundled `proot` instead of the starter. It is
+  used automatically when an unprivileged user namespace would be required
+  but can't be used: when user namespaces are disabled, or when AppArmor
+  restricts them and no AppArmor profile is attached to the starter, as on
+  Ubuntu 24.04 with an installation outside of the packaged paths. It can
+  also be requested with the new `--proot` action and build option, and
+  the new `use proot` directive of `apptainer.conf` (`auto`, `yes` or
+  `no`) controls its use. The mount plan of the container is the same as
+  with a user namespace: image files are mounted with the FUSE image
+  driver through the setuid `fusermount3` (falling back to extracting
+  them to a temporary sandbox when it isn't available), overlays with
+  `fuse-overlayfs`, and bind mounts are performed by proot. `--fakeroot`
+  uses the fake root user of proot, which also allows building from a
+  definition file without privileges. Features requiring namespaces or
+  privileges are refused: instances, `--pid`, `--ipc`, `--net`, `--uts`,
+  `--hostname`, cgroups, `--security`, `--fusemount`, `--nvccli`, CDI
+  device hooks, and encrypted builds. Read-only binds are not enforced. A new
+  `proot-init` helper is installed in `libexec/apptainer/bin`.
 - Add support for building data partitions from tar files using
   `apptainer build --data image.sif input.tar*`. Supports uncompressed (.tar) and
   compressed (.tar.gz, .tar.xz, .tar.zst, .tar.lzo) archives, with decompression

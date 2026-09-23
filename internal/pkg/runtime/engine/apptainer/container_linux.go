@@ -24,7 +24,6 @@ import (
 	"github.com/apptainer/apptainer/internal/pkg/cgroups"
 	"github.com/apptainer/apptainer/internal/pkg/image/driver"
 	"github.com/apptainer/apptainer/internal/pkg/plugin"
-	"github.com/apptainer/apptainer/internal/pkg/runtime/engine/apptainer/rpc/client"
 	"github.com/apptainer/apptainer/internal/pkg/util/cdi"
 	"github.com/apptainer/apptainer/internal/pkg/util/fs"
 	"github.com/apptainer/apptainer/internal/pkg/util/fs/files"
@@ -76,6 +75,28 @@ var defaultCNIConfPath = filepath.Join(buildcfg.SYSCONFDIR, "apptainer", "networ
 // defaultCNIPluginPath is the default directory to CNI plugins executables.
 var defaultCNIPluginPath = filepath.Join(buildcfg.LIBEXECDIR, "apptainer", "cni")
 
+// containerOps performs the container setup operations requiring the
+// container mount namespace, either remotely through the RPC server or
+// locally for the proot runtime.
+//
+//nolint:interfacebloat // mirrors the RPC client API used by the engine
+type containerOps interface {
+	layout.VFS
+	Mount(source string, target string, filesystem string, flags uintptr, data string) error
+	Unmount(target string, flags int) error
+	Decrypt(offset uint64, path string, key []byte, masterPid int) (string, error)
+	Chroot(root string, method string) (int, error)
+	LoopDevice(image string, mode int, info unix.LoopInfo64, maxDevices int, shared bool) (int, error)
+	SetHostname(hostname string) (int, error)
+	Chdir(dir string) (int, error)
+	Lstat(path string) (os.FileInfo, error)
+	Access(path string, mode uint32) error
+	SendFuseFd(socket int, fds []int) error
+	OpenSendFuseFd(socket int) (int, error)
+	NvCCLI(flags []string, rootFsPath string, userNS bool) error
+	OciHook(hook specs.Hook, state specs.State) error
+}
+
 type lastMount struct {
 	dest  string
 	flags uintptr
@@ -83,7 +104,7 @@ type lastMount struct {
 
 type container struct {
 	engine        *EngineOperations
-	rpcOps        *client.RPC
+	rpcOps        containerOps
 	session       *layout.Session
 	sessionFsType string
 	sessionSize   int
@@ -98,10 +119,11 @@ type container struct {
 	suidFlag      uintptr
 	devSourcePath string
 	skipCwd       bool
+	proot         bool
 }
 
 //nolint:maintidx
-func create(ctx context.Context, engine *EngineOperations, rpcOps *client.RPC, pid int) error {
+func create(ctx context.Context, engine *EngineOperations, rpcOps containerOps, pid int) error {
 	var err error
 
 	if len(engine.EngineConfig.GetImageList()) == 0 {
@@ -115,6 +137,7 @@ func create(ctx context.Context, engine *EngineOperations, rpcOps *client.RPC, p
 		mountInfoPath: fmt.Sprintf("/proc/%d/mountinfo", pid),
 		skippedMount:  make([]string, 0),
 		suidFlag:      syscall.MS_NOSUID,
+		proot:         engine.EngineConfig.GetProot(),
 	}
 
 	cwd := engine.EngineConfig.GetCwd()
@@ -165,6 +188,11 @@ func create(ctx context.Context, engine *EngineOperations, rpcOps *client.RPC, p
 	if !c.userNS {
 		c.userNS, _ = namespaces.IsInsideUserNamespace(os.Getpid())
 	}
+	// the proot runtime runs unprivileged without a user namespace,
+	// it requires the same unprivileged setup
+	if c.proot {
+		c.userNS = true
+	}
 
 	// initialize internal image drivers
 	driver.InitImageDrivers(true, c.userNS, c.engine.EngineConfig.File, 0)
@@ -212,8 +240,10 @@ func create(ctx context.Context, engine *EngineOperations, rpcOps *client.RPC, p
 		umountPoints = append(umountPoints, umountPoint{c.session.FinalPath(), false})
 	}
 
-	if err := system.RunAfterTag(mount.SessionTag, c.addMountInfo); err != nil {
-		return err
+	if !c.proot {
+		if err := system.RunAfterTag(mount.SessionTag, c.addMountInfo); err != nil {
+			return err
+		}
 	}
 	if err := system.RunBeforeTag(mount.CwdTag, c.addCwdMount); err != nil {
 		return err
@@ -422,9 +452,14 @@ func (c *container) setupSessionLayout(system *mount.System) error {
 	var err error
 	var sessionPath string
 
-	sessionPath, err = filepath.EvalSymlinks(buildcfg.SESSIONDIR)
-	if err != nil {
-		return fmt.Errorf("failed to resolve session directory %s: %s", buildcfg.SESSIONDIR, err)
+	prootOps, isProot := c.rpcOps.(*prootOps)
+	if isProot {
+		sessionPath = prootOps.sessionPath
+	} else {
+		sessionPath, err = filepath.EvalSymlinks(buildcfg.SESSIONDIR)
+		if err != nil {
+			return fmt.Errorf("failed to resolve session directory %s: %s", buildcfg.SESSIONDIR, err)
+		}
 	}
 
 	sessionLayer := c.engine.EngineConfig.GetSessionLayer()
@@ -444,6 +479,9 @@ func (c *container) setupSessionLayout(system *mount.System) error {
 
 	if err != nil {
 		return fmt.Errorf("while setting %s session layout: %s", sessionLayer, err)
+	}
+	if isProot {
+		prootOps.setSession(c.session)
 	}
 
 	return system.RunAfterTag(mount.SharedTag, c.setPropagationMount)
@@ -513,7 +551,7 @@ func (c *container) setupImageDriver(system *mount.System, containerPid int) err
 		Config:      c.engine.CommonConfig,
 	}
 
-	if c.userNS {
+	if c.userNS && !c.proot {
 		fds, err := c.getFuseFdFromRPC(nil)
 		if err != nil {
 			return fmt.Errorf("while getting /proc/self/ns/user file descriptor: %s", err)
@@ -522,9 +560,12 @@ func (c *container) setupImageDriver(system *mount.System, containerPid int) err
 	}
 
 	fakeroot := c.engine.EngineConfig.GetFakeroot()
-	fakerootHybrid := fakeroot && os.Geteuid() != 0
+	fakerootHybrid := fakeroot && os.Geteuid() != 0 && !c.proot
 
 	if fuseDriver {
+		if c.proot {
+			return fmt.Errorf("image driver %s requires a user namespace", c.engine.EngineConfig.File.ImageDriver)
+		}
 		fuseFd, fuseRPCFd, err := c.openFuseFdFromRPC()
 		if err != nil {
 			return fmt.Errorf("while requesting /dev/fuse file descriptor from RPC: %s", err)
@@ -811,20 +852,23 @@ func (c *container) mountGeneric(mnt *mount.Point, system *mount.System) (err er
 			}
 		}
 		sylog.Debugf("Remounting %s\n", dest)
+		if c.proot && tag == mount.UserbindsTag && slice.ContainsString(mnt.Options, "ro") {
+			sylog.Warningf("Read-only bind of %s is not enforced with proot", mnt.Destination)
+		}
 	} else {
 		sylog.Debugf("Mounting %s to %s\n", source, dest)
 
 		// in stage 1 we changed current working directory to
 		// sandbox image directory, just pass "." as source argument to
 		// be sure RPC mount the right sandbox image
-		if tag == mount.RootfsTag && dest == c.session.RootFsPath() {
+		if tag == mount.RootfsTag && dest == c.session.RootFsPath() && !c.proot {
 			source = "."
 		}
 	}
 
 mount:
 	err = nil
-	if !bindMount && !remount && mnt.Type == "overlay" && tag == mount.LayerTag &&
+	if !bindMount && !remount && mnt.Type == "overlay" && tag == mount.LayerTag && !c.proot &&
 		imageDriver != nil && imageDriver.Features()&image.OverlayFeature != 0 {
 		if c.engine.EngineConfig.File.EnableOverlay == "driver" {
 			// Set an error to switch to the overlay image driver
@@ -955,7 +999,7 @@ mount:
 			return nil
 		}
 		return fmt.Errorf("could not mount %s: %s", mnt.Source, err)
-	} else if mnt.Type == "overlay" {
+	} else if mnt.Type == "overlay" && !c.proot {
 		// The overlay mount succeeded, but under some conditions the
 		// kernel overlayfs exhibits a bizarre behavior where it returns
 		// Permission denied to the user unless the mount happens twice

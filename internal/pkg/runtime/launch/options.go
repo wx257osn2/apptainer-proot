@@ -156,6 +156,7 @@ type launchOptions struct {
 	IgnoreSubuid      bool
 	IgnoreFakerootCmd bool
 	IgnoreUserns      bool
+	Proot             bool // whether proot is requested instead of namespaces
 	UseBuildConfig    bool
 	TmpDir            string
 	Underlay          bool   // whether prefer underlay over overlay
@@ -656,6 +657,15 @@ func OptCdiDirs(dirs []string) Option {
 func OptIntelHpu(b bool) Option {
 	return func(lo *launchOptions) error {
 		lo.IntelHpu = b
+		return nil
+	}
+}
+
+// OptProot requests running the container under proot instead of in
+// namespaces.
+func OptProot(b bool) Option {
+	return func(lo *launchOptions) error {
+		lo.Proot = b
 		return nil
 	}
 }

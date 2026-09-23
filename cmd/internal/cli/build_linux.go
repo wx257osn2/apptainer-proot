@@ -27,6 +27,7 @@ import (
 	"github.com/apptainer/apptainer/internal/pkg/cache"
 	"github.com/apptainer/apptainer/internal/pkg/fakeroot"
 	"github.com/apptainer/apptainer/internal/pkg/ociplatform"
+	"github.com/apptainer/apptainer/internal/pkg/proot"
 	"github.com/apptainer/apptainer/internal/pkg/remote/endpoint"
 	fakerootConfig "github.com/apptainer/apptainer/internal/pkg/runtime/engine/fakeroot/config"
 	"github.com/apptainer/apptainer/internal/pkg/util/env"
@@ -38,12 +39,34 @@ import (
 	"github.com/apptainer/apptainer/pkg/image"
 	"github.com/apptainer/apptainer/pkg/runtime/engine/config"
 	"github.com/apptainer/apptainer/pkg/sylog"
+	"github.com/apptainer/apptainer/pkg/util/apptainerconf"
 	"github.com/apptainer/apptainer/pkg/util/cryptkey"
 	"github.com/apptainer/apptainer/pkg/util/namespaces"
 	keyClient "github.com/apptainer/container-key-client/client"
 	"github.com/ccoveille/go-safecast/v2"
 	"github.com/spf13/cobra"
 )
+
+// buildUseProot returns whether fakeroot is provided by proot instead of a
+// user namespace.
+func buildUseProot() bool {
+	insideUserNs, _ := namespaces.IsInsideUserNamespace(os.Getpid())
+	// an explicit request of a user namespace takes precedence
+	if !buildArgs.proot && (insideUserNs || buildArgs.userns) {
+		return false
+	}
+	conf := apptainerconf.GetCurrentConfig()
+	uid, err := safecast.Convert[uint32](os.Getuid())
+	if err != nil {
+		sylog.Fatalf("while getting uid: %v", err)
+	}
+	setuidUsable := buildcfg.APPTAINER_SUID_INSTALL == 1 && conf.AllowSetuid && fakeroot.IsUIDMapped(uid)
+	useProot, err := proot.Use(buildArgs.proot, conf.UseProot, setuidUsable)
+	if err != nil {
+		sylog.Fatalf("%s", err)
+	}
+	return useProot
+}
 
 func fakerootExec(isDeffile, unprivEncrypt bool) {
 	useSuid := buildcfg.APPTAINER_SUID_INSTALL == 1 && !buildArgs.userns
@@ -410,6 +433,7 @@ func runBuildLocal(ctx context.Context, cmd *cobra.Command, dst, spec string, fa
 		Var:                variant,
 		Platform:           *dp,
 		Reproducible:       buildArgs.reproducible,
+		Proot:              buildArgs.useProot,
 	}
 	config := build.Config{
 		Dest:      dst,

@@ -40,6 +40,34 @@ INSTALLFILES += $(starter_INSTALL)
 ALL += $(starter)
 
 
+# proot-init, executed inside the container by the proot runtime so it
+# must not depend on host shared libraries, seccomp support requiring cgo
+proot_init_deps := $(BUILDDIR_ABSPATH)/proot-init.deps
+
+-include $(proot_init_deps)
+
+$(proot_init_deps): $(GO_MODFILES)
+	@echo " GEN GO DEP" $@
+	$(V)cd $(SOURCEDIR) && ./makeit/gengodep -v3 "$(GO)" "proot_init_SOURCE" "$(GO_TAGS)" "$@" "$(SOURCEDIR)/cmd/proot-init"
+
+proot_init := $(BUILDDIR_ABSPATH)/cmd/proot-init/proot-init
+$(proot_init): $(apptainer_build_config) $(proot_init_deps) $(proot_init_SOURCE)
+	@echo " GO" $@
+	$(V)cd $(SOURCEDIR) && CGO_ENABLED=0 $(GO) build $(GO_MODFLAGS) \
+		$(GO_GCFLAGS) -tags "$(filter-out seccomp,$(GO_TAGS)) osusergo netgo" \
+		-o $@ ./cmd/proot-init
+
+proot_init_INSTALL := $(DESTDIR)$(LIBEXECDIR)/apptainer/bin/proot-init
+$(proot_init_INSTALL): $(proot_init)
+	@echo " INSTALL" $@
+	$(V)umask 0022 && mkdir -p $(@D)
+	$(V)install -m 0755 $(proot_init) $@
+
+CLEANFILES += $(proot_init)
+INSTALLFILES += $(proot_init_INSTALL)
+ALL += $(proot_init)
+
+
 # preload library for offsetting accesses into a file
 offsetpreload := $(BUILDDIR_ABSPATH)/offsetpreload.so
 offsetpreload_SOURCE := $(SOURCEDIR)/tools/offsetpreload.c

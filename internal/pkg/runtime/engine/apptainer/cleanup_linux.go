@@ -78,7 +78,11 @@ func (e *EngineOperations) CleanupContainer(ctx context.Context, _ error, _ sysc
 	e.stopFuseDrivers()
 
 	if imageDriver != nil {
-		if err := umount(); err != nil {
+		umountFunc := umount
+		if e.EngineConfig.GetProot() {
+			umountFunc = prootUmount
+		}
+		if err := umountFunc(); err != nil {
 			sylog.Infof("Cleanup error: %s", err)
 		}
 	}
@@ -89,7 +93,7 @@ func (e *EngineOperations) CleanupContainer(ctx context.Context, _ error, _ sysc
 
 		var err error
 
-		if e.EngineConfig.GetFakeroot() && os.Getuid() != 0 {
+		if e.EngineConfig.GetFakeroot() && os.Getuid() != 0 && !e.EngineConfig.GetProot() {
 			// this is required when we are using SUID workflow
 			// because master process is not in the fakeroot
 			// context and can get permission denied error during

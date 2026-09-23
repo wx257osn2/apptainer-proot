@@ -81,6 +81,7 @@ type File struct {
 	AllowPidNs                bool     `default:"yes" authorized:"yes,no" directive:"allow pid ns"`
 	AllowUserNs               bool     `default:"yes" authorized:"yes,no" directive:"allow user ns"`
 	AllowUtsNs                bool     `default:"yes" authorized:"yes,no" directive:"allow uts ns"`
+	UseProot                  string   `default:"auto" authorized:"auto,yes,no" directive:"use proot"`
 	ConfigPasswd              bool     `default:"yes" authorized:"yes,no" directive:"config passwd"`
 	ConfigGroup               bool     `default:"yes" authorized:"yes,no" directive:"config group"`
 	ConfigResolvConf          bool     `default:"yes" authorized:"yes,no" directive:"config resolv_conf"`
@@ -198,6 +199,16 @@ allow user ns = {{ if eq .AllowUserNs true }}yes{{ else }}no{{ end }}
 # DEFAULT: yes
 # Should we allow users to request the UTS namespace?
 allow uts ns = {{ if eq .AllowUtsNs true }}yes{{ else }}no{{ end }}
+
+# USE PROOT: [auto/yes/no]
+# DEFAULT: auto
+# Whether unprivileged users run containers under proot, without any
+# namespace, instead of in a user namespace.  If 'auto', proot is used when
+# unprivileged user namespaces are disabled, or restricted by AppArmor
+# without a profile allowing the starter.  If 'yes', proot is always used
+# by unprivileged users.  If 'no', proot is never used, even when requested
+# with the '--proot' option.
+use proot = {{ .UseProot }}
 
 # CONFIG PASSWD: [BOOL]
 # DEFAULT: yes

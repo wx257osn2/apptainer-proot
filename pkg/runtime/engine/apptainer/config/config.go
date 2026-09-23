@@ -144,6 +144,7 @@ type JSONConfig struct {
 	SkipBinds             []string          `json:"skipBinds,omitempty"`
 	NoInit                bool              `json:"noInit,omitempty"`
 	Fakeroot              bool              `json:"fakeroot,omitempty"`
+	Proot                 bool              `json:"proot,omitempty"`
 	SignalPropagation     bool              `json:"signalPropagation,omitempty"`
 	RestoreUmask          bool              `json:"restoreUmask,omitempty"`
 	DeleteTempDir         string            `json:"deleteTempDir,omitempty"`
@@ -756,6 +757,17 @@ func (e *EngineConfig) SetFakeroot(fakeroot bool) {
 // GetFakeroot returns if fakeroot is set or not.
 func (e *EngineConfig) GetFakeroot() bool {
 	return e.JSON.Fakeroot
+}
+
+// SetProot sets whether the container runs under proot instead of
+// namespaces.
+func (e *EngineConfig) SetProot(proot bool) {
+	e.JSON.Proot = proot
+}
+
+// GetProot returns whether the container runs under proot.
+func (e *EngineConfig) GetProot() bool {
+	return e.JSON.Proot
 }
 
 // GetDeleteTempDir returns the path of the temporary directory containing the root filesystem

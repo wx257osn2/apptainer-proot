@@ -25,6 +25,7 @@ import (
 	"syscall"
 
 	"github.com/apptainer/apptainer/internal/pkg/buildcfg"
+	"github.com/apptainer/apptainer/internal/pkg/proot"
 	"github.com/apptainer/apptainer/pkg/sylog"
 	"github.com/apptainer/apptainer/pkg/util/fs/proc"
 	"github.com/apptainer/apptainer/pkg/util/namespaces"
@@ -224,6 +225,23 @@ func parseLibraryBinds(buf io.Reader) ([]libBind, error) {
 	return libs, nil
 }
 
+// isolationArgs returns the namespace options of the sandboxed unsquashfs
+// command, or the proot option when containers run under proot, which
+// confines unsquashfs as well but can't make namespaces.
+func isolationArgs(isOnlyRootMapped bool) []string {
+	if !isOnlyRootMapped && proot.Automatic() {
+		return []string{"--proot"}
+	}
+	args := []string{"-i"}
+	// if there are not bind mounts under /proc (which happens under
+	// unprivileged docker), also make a new pid namespace
+	hasMounts, err := proc.HasBindMountsUnderProc()
+	if err == nil && !hasMounts {
+		args = append(args, "-p")
+	}
+	return args
+}
+
 // unsquashfsSandboxCmd is the command instance for executing unsquashfs command
 // in a sandboxed environment with apptainer.
 func unsquashfsSandboxCmd(unsquashfs string, dest string, filename string, filter string, opts ...string) (*exec.Cmd, error) {
@@ -279,21 +297,14 @@ func unsquashfsSandboxCmd(unsquashfs string, dest string, filename string, filte
 		"--no-nv",
 		"--no-rocm",
 		"--contain",
-		"-i",
 		"-e",
 		"--no-init",
 		"--writable",
 		"-B", fmt.Sprintf("%s:%s", tmpdir, rootfsImageDir),
 	}
 
-	// if there are not bind mounts under /proc (which happens under
-	// unprivileged docker), also make a new pid namespace
-	hasMounts, err := proc.HasBindMountsUnderProc()
-	if err == nil && !hasMounts {
-		args = append(args, "-p")
-	}
-
 	isOnlyRootMapped := namespaces.IsOnlyRootMapped()
+	args = append(args, isolationArgs(isOnlyRootMapped)...)
 	if isOnlyRootMapped {
 		// suid mode doesn't work in a root-mapped user namespace
 		args = append(args, "--userns")

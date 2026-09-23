@@ -46,6 +46,7 @@ import (
 	"github.com/apptainer/apptainer/e2e/oci"
 	"github.com/apptainer/apptainer/e2e/overlay"
 	"github.com/apptainer/apptainer/e2e/plugin"
+	"github.com/apptainer/apptainer/e2e/proot"
 	"github.com/apptainer/apptainer/e2e/pull"
 	"github.com/apptainer/apptainer/e2e/push"
 	"github.com/apptainer/apptainer/e2e/registry"
@@ -236,6 +237,7 @@ func Run(t *testing.T) {
 	suite.AddGroup("OCI", oci.E2ETests)
 	suite.AddGroup("OVERLAY", overlay.E2ETests)
 	suite.AddGroup("PLUGIN", plugin.E2ETests)
+	suite.AddGroup("PROOT", proot.E2ETests)
 	suite.AddGroup("PULL", pull.E2ETests)
 	suite.AddGroup("PUSH", push.E2ETests)
 	suite.AddGroup("REGISTRY", registry.E2ETests)

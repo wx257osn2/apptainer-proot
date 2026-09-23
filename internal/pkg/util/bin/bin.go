@@ -65,6 +65,7 @@ func FindBin(name string) (path string, err error) {
 		"nvidia-container-cli",
 		"pacstrap",
 		"proot",
+		"proot-init",
 		"rpm",
 		"rpmkeys",
 		"squashfuse",

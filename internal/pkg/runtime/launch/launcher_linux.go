@@ -29,6 +29,8 @@ import (
 	"github.com/apptainer/apptainer/internal/pkg/image/unpacker"
 	"github.com/apptainer/apptainer/internal/pkg/instance"
 	"github.com/apptainer/apptainer/internal/pkg/plugin"
+	prootutil "github.com/apptainer/apptainer/internal/pkg/proot"
+	apptainerengine "github.com/apptainer/apptainer/internal/pkg/runtime/engine/apptainer"
 	"github.com/apptainer/apptainer/internal/pkg/runtime/engine/config/oci"
 	"github.com/apptainer/apptainer/internal/pkg/runtime/engine/config/oci/generate"
 	"github.com/apptainer/apptainer/internal/pkg/security"
@@ -107,8 +109,21 @@ func NewLauncher(opts ...Option) (*Launcher, error) {
 func (l *Launcher) Exec(ctx context.Context, image string, args []string, instanceName string) error {
 	var err error
 
+	insideUserNs, _ := namespaces.IsInsideUserNamespace(os.Getpid())
+
+	useProot, err := l.useProot(insideUserNs)
+	if err != nil {
+		return err
+	}
+	if useProot {
+		if err := l.checkProotOptions(instanceName); err != nil {
+			return err
+		}
+		sylog.Verbosef("Running container under proot")
+	}
+
 	var fakerootPath string
-	if l.cfg.Fakeroot {
+	if l.cfg.Fakeroot && !useProot {
 		if (l.uid == 0) && namespaces.IsUnprivileged() {
 			// Already running root-mapped unprivileged
 			l.cfg.Fakeroot = false
@@ -185,10 +200,13 @@ func (l *Launcher) Exec(ctx context.Context, image string, args []string, instan
 	// Set container Umask w.r.t. our own, before any umask manipulation happens.
 	l.setUmask()
 
-	insideUserNs, _ := namespaces.IsInsideUserNamespace(os.Getpid())
-
 	// Will we use the suid starter? If not we need to force the user namespace.
-	useSuid := l.useSuid(insideUserNs)
+	// proot runs neither with the suid starter nor with namespaces.
+	useSuid := !useProot && l.useSuid(insideUserNs)
+	if useProot {
+		l.engineConfig.SetProot(true)
+		l.engineConfig.SetTmpDir(l.cfg.TmpDir)
+	}
 	l.suid = useSuid
 	// IgnoreUserns is a hidden control flag
 	l.cfg.Namespaces.User = l.cfg.Namespaces.User && !l.cfg.IgnoreUserns
@@ -326,7 +344,7 @@ func (l *Launcher) Exec(ctx context.Context, image string, args []string, instan
 
 	// Are we running with userns and subuid / subgid fakeroot functionality?
 	l.engineConfig.SetFakeroot(l.cfg.Fakeroot)
-	if l.cfg.Fakeroot {
+	if l.cfg.Fakeroot && !useProot {
 		l.cfg.Namespaces.User = !l.cfg.IgnoreUserns
 	}
 
@@ -346,8 +364,12 @@ func (l *Launcher) Exec(ctx context.Context, image string, args []string, instan
 		l.engineConfig.SetContain(true)
 		// --containall infers PID/IPC isolation and a clean environment.
 		if l.cfg.ContainAll {
-			l.cfg.Namespaces.PID = true
-			l.cfg.Namespaces.IPC = true
+			if useProot {
+				sylog.Warningf("PID and IPC namespaces of --containall are not available with proot")
+			} else {
+				l.cfg.Namespaces.PID = true
+				l.cfg.Namespaces.IPC = true
+			}
 			l.cfg.CleanEnv = true
 		}
 	}
@@ -433,6 +455,10 @@ func (l *Launcher) Exec(ctx context.Context, image string, args []string, instan
 
 	// Allow any plugins with callbacks to modify the assembled Config
 	runPluginCallbacks(cfg)
+
+	if useProot {
+		return l.execProot(ctx, cfg)
+	}
 
 	// Call the starter binary using our prepared config.
 	if l.engineConfig.GetInstance() && !l.cfg.ShareNSMode {
@@ -669,6 +695,64 @@ func (l *Launcher) useSuid(insideUserNs bool) (useSuid bool) {
 		}
 	}
 	return useSuid
+}
+
+// useProot checks whether to run the container under proot, when requested
+// or when an unprivileged user namespace would be required but is unusable.
+func (l *Launcher) useProot(insideUserNs bool) (bool, error) {
+	// an explicit request of a user namespace takes precedence
+	if !l.cfg.Proot && (insideUserNs || l.cfg.Namespaces.User) {
+		return false, nil
+	}
+	setuidUsable := buildcfg.APPTAINER_SUID_INSTALL == 1 && l.engineConfig.File.AllowSetuid
+	return prootutil.Use(l.cfg.Proot, l.engineConfig.File.UseProot, setuidUsable)
+}
+
+// checkProotOptions returns an error for the first requested feature which
+// requires namespaces or privileges, and so is not available with proot.
+func (l *Launcher) checkProotOptions(instanceName string) error {
+	unsupported := []struct {
+		feature   string
+		requested bool
+	}{
+		{"instances", instanceName != ""},
+		{"--userns", l.cfg.Namespaces.User},
+		{"--pid", l.cfg.Namespaces.PID},
+		{"--ipc", l.cfg.Namespaces.IPC},
+		{"--net", l.cfg.Namespaces.Net},
+		{"--uts", l.cfg.Namespaces.UTS},
+		{"--hostname", l.cfg.Hostname != ""},
+		{"--netns-path", l.cfg.NetnsPath != ""},
+		{"cgroups resource limits", l.cfg.CGroupsJSON != ""},
+		{"--security", len(l.cfg.SecurityOpts) > 0},
+		{"--fusemount", len(l.cfg.FuseMount) > 0},
+		{"--nvccli", l.cfg.NvCCLI},
+		{"--boot", l.cfg.Boot},
+		{"--sharens", l.cfg.ShareNSMode},
+	}
+	for _, u := range unsupported {
+		if u.requested {
+			return fmt.Errorf("%s not supported with proot", u.feature)
+		}
+	}
+	if l.cfg.AddCaps != "" || l.cfg.DropCaps != "" {
+		sylog.Warningf("Capabilities are ignored with proot")
+	}
+	return nil
+}
+
+// execProot runs the container under proot, then exits with the status of
+// the container process as the starter would.
+func (l *Launcher) execProot(ctx context.Context, cfg *config.Common) error {
+	status, err := apptainerengine.ProotRun(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("while running container with proot: %w", err)
+	}
+	if status.Signaled() {
+		os.Exit(128 + int(status.Signal()))
+	}
+	os.Exit(status.ExitStatus())
+	return nil
 }
 
 // setBinds sets engine configuration for requested bind mounts.
@@ -1273,7 +1357,8 @@ func (l *Launcher) prepareImage(_ context.Context, insideUserNs bool, image stri
 		desiredFeatures = imgutil.ImageFeature
 	}
 	fileconf := l.engineConfig.File
-	driver.InitImageDrivers(true, l.cfg.Namespaces.User || insideUserNs, fileconf, desiredFeatures)
+	unprivileged := l.cfg.Namespaces.User || insideUserNs || l.engineConfig.GetProot()
+	driver.InitImageDrivers(true, unprivileged, fileconf, desiredFeatures)
 
 	// convert image file to sandbox if either it was requested by
 	// `--unsquash` or we cannot mount the image directly and there's
@@ -1282,8 +1367,7 @@ func (l *Launcher) prepareImage(_ context.Context, insideUserNs bool, image stri
 		convert := false
 		if l.cfg.Unsquash {
 			convert = true
-		} else if l.cfg.Namespaces.User || insideUserNs ||
-			!squashfs.SetuidMountAllowed(fileconf) {
+		} else if unprivileged || !squashfs.SetuidMountAllowed(fileconf) {
 			convert = true
 			if fileconf.ImageDriver != "" {
 				// load image driver plugins
@@ -1303,6 +1387,13 @@ func (l *Launcher) prepareImage(_ context.Context, insideUserNs bool, image stri
 					// the image driver indicates support for squashfs so let's
 					// proceed with the image driver without conversion
 					convert = false
+				}
+				if l.engineConfig.GetProot() {
+					// without namespaces FUSE mounts require fusermount
+					if _, err := prootutil.Fusermount(); err != nil {
+						sylog.Infof("%s, can't mount images with FUSE", err)
+						convert = true
+					}
 				}
 			}
 		}

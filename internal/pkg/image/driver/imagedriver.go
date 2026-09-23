@@ -63,6 +63,7 @@ type fuseappsDriver struct {
 	cmdPrefix      []string
 	squashSetUID   bool
 	unprivileged   bool
+	hostMode       bool // unprivileged without CAP_SYS_ADMIN, mounting through fusermount
 	stopped        atomic.Bool
 	mountErrCh     chan error
 	instanceCh     chan *fuseappsInstance
@@ -167,6 +168,8 @@ func InitImageDrivers(register, unprivileged bool, fileconf *apptainerconf.File,
 		sylog.Debugf("Setting ImageDriver to %v", DriverName)
 		fileconf.ImageDriver = DriverName
 		if register {
+			permitted, _ := capabilities.GetProcessPermitted()
+			canMount := permitted&(1<<capabilities.Map["CAP_SYS_ADMIN"].Value) != 0
 			driver := &fuseappsDriver{
 				squashFeature:  squashFeature,
 				ext3Feature:    ext3Feature,
@@ -176,6 +179,7 @@ func InitImageDrivers(register, unprivileged bool, fileconf *apptainerconf.File,
 				cmdPrefix:      []string{},
 				squashSetUID:   squashSetUID,
 				unprivileged:   unprivileged,
+				hostMode:       unprivileged && os.Getuid() != 0 && !canMount,
 				mountErrCh:     make(chan error, 1),
 				instanceCh:     make(chan *fuseappsInstance),
 			}
@@ -219,38 +223,44 @@ func (d *fuseappsDriver) Mount(params *image.MountParams, _ image.MountFunc) err
 	var f *fuseappsFeature
 	var cmd *exec.Cmd
 	cmdArgs := d.cmdPrefix
+	var opts []string
 	// This avoids sometimes seeing "Permission denied" when FUSE
 	// is fooled into thinking two different user ids are involved.
-	optsStr := "allow_other"
+	// In host mode only the user accesses the mount, and fusermount
+	// refuses allow_other without user_allow_other in /etc/fuse.conf.
+	if !d.hostMode {
+		opts = append(opts, "allow_other")
+	}
 	if (params.Flags & syscall.MS_RDONLY) != 0 {
-		optsStr += ",ro"
+		opts = append(opts, "ro")
 	}
 	switch params.Filesystem {
 	case "overlay":
 		f = &d.overlayFeature
-		if len(params.FSOptions) > 0 {
-			optsStr += "," + strings.Join(params.FSOptions, ",")
+		for _, opt := range params.FSOptions {
+			// Ignore xino=on option with fuse-overlayfs
+			if opt != "xino=on" {
+				opts = append(opts, opt)
+			}
 		}
-		// Ignore xino=on option with fuse-overlayfs
-		optsStr = strings.ReplaceAll(optsStr, ",xino=on", "")
 		// noacl is needed to avoid failures when the upper layer
 		// filesystem type (for example tmpfs) does not support it,
 		// when the fuse-overlayfs version is 1.8 or greater.
-		optsStr += ",noacl"
-		cmdArgs = append(cmdArgs, f.cmdPath, "-f", "-o", optsStr, params.Target)
+		opts = append(opts, "noacl")
+		cmdArgs = append(cmdArgs, f.cmdPath, "-f", "-o", strings.Join(opts, ","), params.Target)
 		cmd = exec.Command(cmdArgs[0], cmdArgs[1:]...)
 
 	case "squashfs":
 		f = &d.squashFeature
 		if d.squashSetUID {
-			optsStr += fmt.Sprintf(",uid=%v,gid=%v", os.Getuid(), os.Getgid())
+			opts = append(opts, fmt.Sprintf("uid=%v", os.Getuid()), fmt.Sprintf("gid=%v", os.Getgid()))
 		}
 		if params.Offset > 0 {
-			optsStr += ",offset=" + strconv.FormatUint(params.Offset, 10)
+			opts = append(opts, "offset="+strconv.FormatUint(params.Offset, 10))
 		}
 		cmdArgs = append(cmdArgs, f.cmdPath, "-f")
-		if optsStr != "" {
-			cmdArgs = append(cmdArgs, "-o", optsStr)
+		if len(opts) > 0 {
+			cmdArgs = append(cmdArgs, "-o", strings.Join(opts, ","))
 		}
 		cmdArgs = append(cmdArgs, params.Source, params.Target)
 		cmd = exec.Command(cmdArgs[0], cmdArgs[1:]...)
@@ -264,7 +274,7 @@ func (d *fuseappsDriver) Mount(params *image.MountParams, _ image.MountFunc) err
 		if os.Getuid() != 0 {
 			// Bypass permission checks so all can be read,
 			//  especially overlay work dir
-			optsStr += ",fakeroot"
+			opts = append(opts, "fakeroot")
 		}
 		stdbuf, err := bin.FindBin("stdbuf")
 		if err == nil {
@@ -272,7 +282,7 @@ func (d *fuseappsDriver) Mount(params *image.MountParams, _ image.MountFunc) err
 			//  warnings sometimes sent through stdout
 			cmdArgs = append(cmdArgs, stdbuf, "-oL")
 		}
-		cmdArgs = append(cmdArgs, f.cmdPath, "-f", "-o", optsStr, params.Source, params.Target)
+		cmdArgs = append(cmdArgs, f.cmdPath, "-f", "-o", strings.Join(opts, ","), params.Source, params.Target)
 		cmd = exec.Command(cmdArgs[0], cmdArgs[1:]...)
 
 		if params.Offset > 0 {
@@ -362,7 +372,7 @@ func (d *fuseappsDriver) Mount(params *image.MountParams, _ image.MountFunc) err
 
 	// When using gocryptfs for build step or when running in setuid mode,
 	// we should not run with the elevated CAP_SYS_ADMIN privilege.
-	if !params.DontElevatePrivs {
+	if !params.DontElevatePrivs && !d.hostMode {
 		cmd.SysProcAttr.AmbientCaps = []uintptr{
 			uintptr(capabilities.Map["CAP_SYS_ADMIN"].Value),
 			// Needed for nsenter

@@ -148,7 +148,7 @@ func (e *EngineOperations) PrepareConfig(starterConfig *starter.Config) error {
 	}
 
 	userNS, _ := namespaces.IsInsideUserNamespace(os.Getpid())
-	userNS = userNS || e.EngineConfig.GetFakeroot()
+	userNS = userNS || e.EngineConfig.GetFakeroot() || e.EngineConfig.GetProot()
 	driver.InitImageDrivers(true, userNS, e.EngineConfig.File, 0)
 	imageDriver = image.GetDriver(e.EngineConfig.File.ImageDriver)
 
@@ -682,7 +682,7 @@ func (e *EngineOperations) prepareContainerConfig(starterConfig *starter.Config)
 		e.removeNamespace(specs.PIDNamespace)
 	}
 
-	if !e.EngineConfig.File.AllowUserNs {
+	if !e.EngineConfig.File.AllowUserNs && !e.EngineConfig.GetProot() {
 		if buildcfg.APPTAINER_SUID_INSTALL == 0 {
 			sylog.Fatalf("Unprivileged installation found, user namespace needed but not allowed by configuration.")
 		}
@@ -721,7 +721,8 @@ func (e *EngineOperations) prepareContainerConfig(starterConfig *starter.Config)
 		starterConfig.SetMountPropagation("rprivate")
 	}
 
-	if e.EngineConfig.GetFakeroot() {
+	// with proot, fakeroot is emulated by proot itself
+	if e.EngineConfig.GetFakeroot() && !e.EngineConfig.GetProot() {
 		uid, err := safecast.Convert[uint32](os.Getuid())
 		if err != nil {
 			return err
@@ -1192,6 +1193,14 @@ func (e *EngineOperations) checkSignalPropagation() {
 func (e *EngineOperations) setSessionLayer(img *image.Image) error {
 	e.EngineConfig.SetSessionLayer(apptainerConfig.DefaultLayer)
 
+	// The underlay layer relies on bind mounts of the root filesystem
+	// content which proot can't expose. It's not needed either since the
+	// read-only overlay is emulated by proot without overlayfs.
+	proot := e.EngineConfig.GetProot()
+	if proot && (e.EngineConfig.GetUnderlay() || e.EngineConfig.File.EnableUnderlay == "preferred") {
+		sylog.Debugf("Using overlay instead of underlay with proot")
+	}
+
 	writableTmpfs := e.EngineConfig.GetWritableTmpfs()
 	writableImage := e.EngineConfig.GetWritableImage()
 	hasOverlayImage := len(e.EngineConfig.GetOverlayImage()) > 0
@@ -1244,12 +1253,12 @@ func (e *EngineOperations) setSessionLayer(img *image.Image) error {
 		return nil
 	}
 
-	if e.EngineConfig.File.EnableUnderlay == "preferred" {
+	if e.EngineConfig.File.EnableUnderlay == "preferred" && !proot {
 		sylog.Debugf("Using 'underlay' because 'enable underlay = preferred' option")
 		e.EngineConfig.SetSessionLayer(apptainerConfig.UnderlayLayer)
 		return nil
 	}
-	if e.EngineConfig.GetUnderlay() {
+	if e.EngineConfig.GetUnderlay() && !proot {
 		if e.EngineConfig.File.EnableUnderlay == "no" {
 			return fmt.Errorf("'--underlay' requires 'enable underlay = yes', but set to 'no' by administrator")
 		}
@@ -1264,7 +1273,7 @@ func (e *EngineOperations) setSessionLayer(img *image.Image) error {
 		e.EngineConfig.SetOverlayImplied(true)
 		return nil
 	}
-	if e.EngineConfig.File.EnableUnderlay != "no" {
+	if e.EngineConfig.File.EnableUnderlay != "no" && !proot {
 		sylog.Debugf("Using 'underlay' because overlay is disabled and underlay is not")
 		e.EngineConfig.SetSessionLayer(apptainerConfig.UnderlayLayer)
 		return nil
@@ -1318,7 +1327,7 @@ func (e *EngineOperations) loadImages(starterConfig *starter.Config, userNS bool
 		// C starter code will position current working directory
 		starterConfig.SetWorkingDirectoryFd(int(img.Fd))
 
-		if e.EngineConfig.GetSessionLayer() == apptainerConfig.OverlayLayer &&
+		if e.EngineConfig.GetSessionLayer() == apptainerConfig.OverlayLayer && !e.EngineConfig.GetProot() &&
 			(imageDriver == nil || imageDriver.Features()&image.OverlayFeature == 0) {
 			if err := overlay.CheckLower(img.Path); overlay.IsIncompatible(err) {
 				layer := apptainerConfig.UnderlayLayer

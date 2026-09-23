@@ -369,6 +369,7 @@ func launchContainer(cmd *cobra.Command, image string, args []string, instanceNa
 		launch.OptIgnoreSubuid(ignoreSubuid),
 		launch.OptIgnoreFakerootCmd(ignoreFakerootCmd),
 		launch.OptIgnoreUserns(ignoreUserns),
+		launch.OptProot(useProot),
 		launch.OptUseBuildConfig(useBuildConfig),
 		launch.OptTmpDir(tmpDir),
 		launch.OptUnderlay(underlay),

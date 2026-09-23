@@ -115,6 +115,12 @@ contents:
       mode: 0755
       owner: root
       group: root
+  - src: ./builddir/cmd/proot-init/proot-init
+    dst: {{ .LibExecDir }}/{{ .AppName }}/bin/proot-init
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
 {{- if not .Rootless }}
   - src: ./builddir/cmd/starter/c/starter-suid
     dst: {{ .LibExecDir }}/{{ .AppName }}/bin/starter-suid

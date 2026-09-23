@@ -135,6 +135,8 @@ type Options struct {
 	Platform ggcrv1.Platform
 	// Reproducible build
 	Reproducible bool
+	// Proot provides fakeroot with proot instead of a user namespace
+	Proot bool
 }
 
 // NewEncryptedBundle creates an Encrypted Bundle environment.

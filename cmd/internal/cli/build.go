@@ -58,6 +58,8 @@ var buildArgs struct {
 	ignoreFakerootCmd   bool     // Ignore fakeroot command (hidden)
 	ignoreProot         bool     // Ignore proot command (hidden)
 	ignoreUserns        bool     // Ignore user namespace(hidden)
+	proot               bool     // Use proot instead of user namespaces
+	useProot            bool     // Whether proot is used for fakeroot
 	remote              bool     // Remote flag(hidden, only for helpful error message)
 	reproducible        bool     // Reproducible build
 	buildVarArgs        []string // Variables passed to build procedure.
@@ -347,6 +349,16 @@ var buildIgnoreUsernsFlag = cmdline.Flag{
 	Hidden:       true,
 }
 
+// --proot
+var buildProotFlag = cmdline.Flag{
+	ID:           "buildProotFlag",
+	Value:        &buildArgs.proot,
+	DefaultValue: false,
+	Name:         "proot",
+	Usage:        "use proot instead of user namespaces for fakeroot",
+	EnvKeys:      []string{"PROOT"},
+}
+
 var buildRemoteFlag = cmdline.Flag{
 	ID:           "remoteFlag",
 	Value:        &buildArgs.remote,
@@ -438,6 +450,7 @@ func init() {
 		cmdManager.RegisterFlagForCmd(&buildIgnoreFakerootCommand, buildCmd)
 		cmdManager.RegisterFlagForCmd(&buildIgnoreProot, buildCmd)
 		cmdManager.RegisterFlagForCmd(&buildIgnoreUsernsFlag, buildCmd)
+		cmdManager.RegisterFlagForCmd(&buildProotFlag, buildCmd)
 		cmdManager.RegisterFlagForCmd(&buildRemoteFlag, buildCmd)
 		cmdManager.RegisterFlagForCmd(&buildReproducibleFlag, buildCmd)
 
@@ -469,7 +482,14 @@ func preRun(cmd *cobra.Command, args []string) {
 	}
 	spec := args[len(args)-1]
 	isDeffile := fs.IsFile(spec) && !isImage(spec)
-	if buildArgs.fakeroot {
+	needFakeroot := buildArgs.fakeroot || (os.Getuid() != 0 && (isDeffile || buildArgs.encrypt))
+	if needFakeroot && buildUseProot() {
+		if buildArgs.encrypt {
+			sylog.Fatalf("Building with encryption is not supported with proot")
+		}
+		sylog.Verbosef("Using proot for fakeroot")
+		buildArgs.useProot = true
+	} else if buildArgs.fakeroot {
 		fakerootExec(isDeffile, false)
 	} else {
 		if os.Getuid() != 0 {

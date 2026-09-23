@@ -56,6 +56,14 @@ func NewConfig(config SConfig) *Config {
 	}
 }
 
+// NewLocalConfig allocates a zeroed Config which is not shared with any
+// starter process, for engines prepared without the starter binary.
+func NewLocalConfig() *Config {
+	return &Config{
+		config: SConfig(C.calloc(1, C.sizeof_struct_starterConfig)),
+	}
+}
+
 // GetIsSUID returns True if the SUID workflow is enabled.
 // This field is set by starter at the very beginning of its execution.
 func (c *Config) GetIsSUID() bool {
