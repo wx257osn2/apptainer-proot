@@ -8,26 +8,10 @@ jobs:
   build:
     strategy:
       matrix:
-        include:
-          - image: ubuntu-24.04
-            arch: x86_64
-            ubuntu: ubuntu2404
-          - image: ubuntu-24.04-arm
-            arch: aarch64
-            ubuntu: ubuntu2404
-          - image: ubuntu-26.04
-            arch: x86_64
-            ubuntu: ubuntu2604
-          - image: ubuntu-26.04-arm
-            arch: aarch64
-            ubuntu: ubuntu2604
+        image: [ubuntu-26.04, ubuntu-26.04-arm]
     runs-on: ${{ matrix.image }}
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-    - name: stop update man-page
-      run: |
-        echo "set man-db/auto-update false" | sudo debconf-communicate
-        sudo dpkg-reconfigure man-db
     - uses: actions/checkout@v7
       with:
         repository: 'wx257osn2/apptainer-proot'
@@ -35,59 +19,249 @@ jobs:
     - name: build
       shell: bash
       run: |
-        sudo apt-get update
-        sudo apt-get install -y libseccomp-dev libtalloc-dev libattr1-dev libprotobuf-c-dev libfuse3-dev zlib1g-dev liblzo2-dev liblz4-dev liblzma-dev libzstd-dev uuid-dev autoconf automake libtool pkg-config curl zstd patch
-        ./mconfig -p /opt/apptainer --without-suid
-        pushd ./builddir
-        make -j $(nproc)
-        make install
-        popd
+        cat > "${RUNNER_TEMP}/build.sh" << 'EOF'
+        #!/bin/bash
+        set -euxo pipefail
+
+        PREFIX=/opt/apptainer
+        GLIBC_MIN=2.28
+        FUSE_VERSION=3.16.2
+        E2FSPROGS_REF=e4f17380b2e5b8356ab9806689f780d386ce8e3e
+        ARCH=$(uname -m)
+        case "${ARCH}" in
+          x86_64) GOARCH=amd64 ;;
+          aarch64) GOARCH=arm64 ;;
+        esac
+
+        dnf install -y dnf-plugins-core epel-release
+        dnf config-manager --set-enabled powertools
+        dnf install -y gcc-toolset-14-gcc make git autoconf automake libtool \
+          pkgconf-pkg-config patch file findutils diffutils which curl zstd \
+          libseccomp-devel libtalloc-devel protobuf-c-devel libattr-devel \
+          lzo-devel lz4-devel libzstd-devel xz-devel zlib-devel libuuid-devel \
+          meson ninja-build patchelf
+        set +u
+        source /opt/rh/gcc-toolset-14/enable
+        set -u
+        git config --global --add safe.directory "${PWD}"
+
+        GO_VERSION=$(scripts/get-min-go-version)
+        curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz" | tar -xz -C /usr/local
+        export PATH=/usr/local/go/bin:${PATH}
+
+        FUSE_SRC=$(mktemp -d)
+        FUSE_TARBALL=$(mktemp -d)/fuse-${FUSE_VERSION}.tar.gz
+        curl -fsSL -o "${FUSE_TARBALL}" "https://github.com/libfuse/libfuse/releases/download/fuse-${FUSE_VERSION}/fuse-${FUSE_VERSION}.tar.gz"
+        tar -xzf "${FUSE_TARBALL}" -C "${FUSE_SRC}" --strip-components=1
+        meson setup "${FUSE_SRC}/build" "${FUSE_SRC}" --prefix=/usr -Dutils=false -Dexamples=false -Dtests=false
+        ninja -C "${FUSE_SRC}/build" install
+
+        ./mconfig -p "${PREFIX}" --without-suid --without-libsubid
+        make -C builddir -j "$(nproc)"
+        make -C builddir install
+
         mkdir -p deps
-        ./scripts/download-dependencies ./deps
-        rm ./deps/e2fsprogs*.tar.gz
-        mkdir -p ./deps/e2fsprogs-e4f17380b2e5
-        curl -fsSL https://github.com/wx257osn2/tytso-e2fsprogs/archive/e4f17380b2e5b8356ab9806689f780d386ce8e3e.tar.gz | tar -xz -C "./deps/e2fsprogs-e4f17380b2e5" --strip-component=1
-        tar -czf "./deps/e2fsprogs-e4f17380b2e5.tar.gz" -C "./deps" "e2fsprogs-e4f17380b2e5"
-        rm -r "./deps/e2fsprogs-e4f17380b2e5"
-        pushd deps
-        ../scripts/compile-dependencies .
-        ../scripts/install-dependencies /opt/apptainer/libexec
-        popd
-        tar -C /opt -cf ./${{ matrix.ubuntu }}-${{ matrix.arch }}.tar.zst --use-compress-program="zstdmt -18" apptainer
+        ./scripts/download-dependencies deps
+        rm deps/e2fsprogs*.tar.gz
+        E2FSPROGS_DIR=e2fsprogs-${E2FSPROGS_REF:0:12}
+        mkdir "deps/${E2FSPROGS_DIR}"
+        curl -fsSL "https://github.com/wx257osn2/tytso-e2fsprogs/archive/${E2FSPROGS_REF}.tar.gz" | tar -xz -C "deps/${E2FSPROGS_DIR}" --strip-components=1
+        tar -czf "deps/${E2FSPROGS_DIR}.tar.gz" -C deps "${E2FSPROGS_DIR}"
+        rm -r "deps/${E2FSPROGS_DIR}"
+        (cd deps && ../scripts/compile-dependencies . && ../scripts/install-dependencies "${PREFIX}/libexec")
+
+        is_host_lib() {
+          case "$1" in
+            ld-linux*|linux-vdso*|libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*|libresolv.so.*|libutil.so.*|libanl.so.*|libgcc_s.so.*)
+              return 0 ;;
+          esac
+          return 1
+        }
+        mkdir -p "${PREFIX}/lib"
+        mapfile -t ELFS < <(find "${PREFIX}" -type f -exec sh -c 'file -b "$1" | grep -q "^ELF.*dynamically linked"' _ {} \; -print)
+        for ELF in "${ELFS[@]}"; do
+          bundled=false
+          while read -r NAME ARROW LIBPATH _; do
+            if [ "${ARROW}" != "=>" ] || [ ! -f "${LIBPATH}" ]; then
+              continue
+            fi
+            is_host_lib "${NAME}" && continue
+            bundled=true
+            [ -f "${PREFIX}/lib/${NAME}" ] || cp -L "${LIBPATH}" "${PREFIX}/lib/${NAME}"
+          done < <(ldd "${ELF}")
+          if $bundled; then
+            patchelf --force-rpath --set-rpath "\$ORIGIN/$(realpath --relative-to="$(dirname "${ELF}")" "${PREFIX}/lib")" "${ELF}"
+          fi
+        done
+        for LIB in "${PREFIX}"/lib/*; do
+          patchelf --force-rpath --set-rpath "\$ORIGIN" "${LIB}"
+        done
+
+        SOURCES_NAME=sources-${ARCH}
+        DOC=${PREFIX}/share/doc/bundled
+        mkdir -p "${DOC}"
+        GPL_SRPMS=()
+        for DIR in deps/*/; do
+          NAME=$(basename "${DIR}")
+          echo "${NAME}: source ${NAME}.tar.gz in ${SOURCES_NAME}.tar.zst" >>"${DOC}/SOURCES"
+          mkdir -p "${DOC}/${NAME}"
+          find "${DIR}" -maxdepth 1 -type f \( -iname 'COPYING*' -o -iname 'LICEN[CS]E*' -o -iname 'NOTICE*' \) -exec cp -t "${DOC}/${NAME}" {} +
+          if [ -z "$(ls -A "${DOC}/${NAME}")" ]; then
+            echo "no license file in ${DIR}" >&2
+            exit 1
+          fi
+        done
+        for PATCH in deps/*.patch; do
+          if [ -f "${PATCH}" ]; then
+            echo "${PATCH##*/}: applied to the source of the package it is named after, in ${SOURCES_NAME}.tar.zst" >>"${DOC}/SOURCES"
+          fi
+        done
+        for LIB in "${PREFIX}"/lib/*; do
+          LIBNAME=${LIB##*/}
+          case "${LIBNAME}" in
+            libfuse3.so.*)
+              echo "${LIBNAME}: fuse-${FUSE_VERSION}, source fuse-${FUSE_VERSION}.tar.gz in ${SOURCES_NAME}.tar.zst, license LGPL-2.1-only" >>"${DOC}/SOURCES"
+              mkdir -p "${DOC}/fuse"
+              cp "${FUSE_SRC}/LGPL2.txt" "${DOC}/fuse/"
+              ;;
+            *)
+              PKG=$(rpm -qf --qf '%{NAME}\n' "/usr/lib64/${LIBNAME}")
+              LICENSE=$(rpm -q --qf '%{LICENSE}' "${PKG}")
+              INFO=$(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}, source %{SOURCERPM}' "${PKG}")
+              case "${LICENSE}" in
+                *GPL*)
+                  GPL_SRPMS+=("$(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}' "${PKG}")")
+                  INFO="${INFO} in ${SOURCES_NAME}.tar.zst"
+                  ;;
+              esac
+              echo "${LIBNAME}: ${INFO}, license ${LICENSE}" >>"${DOC}/SOURCES"
+              rpm -qL "${PKG}" | while read -r FILE; do
+                if [ -f "${FILE}" ]; then
+                  mkdir -p "${DOC}/${PKG}"
+                  cp "${FILE}" "${DOC}/${PKG}/"
+                fi
+              done
+              ;;
+          esac
+        done
+
+        status=0
+        for ELF in "${ELFS[@]}" "${PREFIX}"/lib/*; do
+          VERSION=$(objdump -T "${ELF}" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n 1)
+          if [ -n "${VERSION}" ] && [ "$(printf '%s\n' "${GLIBC_MIN}" "${VERSION}" | sort -V | tail -n 1)" != "${GLIBC_MIN}" ]; then
+            echo "${ELF} requires glibc ${VERSION}" >&2
+            status=1
+          fi
+          while read -r NAME ARROW LIBPATH _; do
+            [ "${ARROW}" = "=>" ] || continue
+            is_host_lib "${NAME}" && continue
+            case "$(realpath -m "${LIBPATH}")" in
+              "${PREFIX}"/lib/*) ;;
+              *) echo "${ELF} uses ${NAME} from ${LIBPATH}" >&2; status=1 ;;
+            esac
+          done < <(ldd "${ELF}")
+        done
+        [ "$status" = 0 ]
+
+        tar -C "$(dirname "${PREFIX}")" -cf "${ARCH}.tar.zst" --use-compress-program="zstd -T0 -18" "$(basename "${PREFIX}")"
+
+        mkdir "${SOURCES_NAME}"
+        cp deps/*.tar.gz "${FUSE_TARBALL}" "${DOC}/SOURCES" "${SOURCES_NAME}/"
+        for PATCH in deps/*.patch; do
+          if [ -f "${PATCH}" ]; then cp "${PATCH}" "${SOURCES_NAME}/"; fi
+        done
+        cp "$0" "${SOURCES_NAME}/build.sh"
+        cp scripts/download-dependencies scripts/compile-dependencies scripts/install-dependencies "${SOURCES_NAME}/"
+        (cd "${SOURCES_NAME}" && dnf download --source "${GPL_SRPMS[@]}")
+        tar -cf "${SOURCES_NAME}.tar.zst" --use-compress-program="zstd -T0 -18" "${SOURCES_NAME}"
+        EOF
+        docker run --rm -v "${PWD}:/src" -v "${RUNNER_TEMP}/build.sh:/build.sh:ro" -w /src rockylinux:8 bash /build.sh
     - uses: actions/upload-artifact@v7
       with:
-        name: archive-${{ matrix.ubuntu }}-${{ matrix.arch }}
-        path: ./${{ matrix.ubuntu }}-${{ matrix.arch }}.tar.zst
+        name: archive-${{ matrix.image == 'ubuntu-26.04' && 'x86_64' || 'aarch64' }}
+        path: |
+          ./${{ matrix.image == 'ubuntu-26.04' && 'x86_64' || 'aarch64' }}.tar.zst
+          ./sources-${{ matrix.image == 'ubuntu-26.04' && 'x86_64' || 'aarch64' }}.tar.zst
+  test:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu-26.04, ubuntu-26.04-arm]
+        distro: ['rockylinux:8', 'debian:12', 'ubuntu:22.04', 'ubuntu:26.04', 'fedora:latest', 'opensuse/leap:16.0']
+    runs-on: ${{ matrix.image }}
+    steps:
+    - uses: actions/download-artifact@v8
+      with:
+        name: archive-${{ matrix.image == 'ubuntu-26.04' && 'x86_64' || 'aarch64' }}
+    - name: test
+      shell: bash
+      run: |
+        set -euo pipefail
+        TARBALL=$(realpath "$(uname -m).tar.zst")
+        IMAGE='${{ matrix.distro }}'
+        WORK=$(mktemp -d)
+        chmod 755 "${WORK}"
+        trap 'docker rm -f "${NAME}" >/dev/null 2>&1 || true; rm -rf "${WORK}"' EXIT
+        NAME=apptainer-test-$$
+
+        tar -C "${WORK}" -xf "${TARBALL}" --use-compress-program=zstd
+        "${WORK}/apptainer/bin/apptainer" pull "${WORK}/alpine.sif" docker://alpine:3.20
+        (cd "${WORK}" && find apptainer -type f -exec sh -c 'file -b "$(uname -m).tar.zst" | grep -q "^ELF.*dynamically linked"' _ {} \; -print) >"${WORK}/elfs"
+
+        docker run -d --name "${NAME}" -v "${WORK}:/work:ro" "${IMAGE}" sleep infinity >/dev/null
+        docker exec "${NAME}" sh -c 'echo "tester:x:1001:1001::/home/tester:/bin/sh" >>/etc/passwd && echo "tester:x:1001:" >>/etc/group && mkdir -p /home/tester && chown 1001:1001 /home/tester && if [ ! -e /etc/localtime ]; then touch /etc/localtime; fi'
+        docker exec -u 1001:1001 -e HOME=/home/tester -w /home/tester "${NAME}" sh -euc '
+          cp -a /work/apptainer "${HOME}/relocated"
+          A=${HOME}/relocated/bin/apptainer
+          while read -r ELF; do
+            if ldd "${HOME}/relocated/${ELF#apptainer/}" | grep "not found"; then
+              echo "missing libraries for ${ELF}" >&2
+              exit 1
+            fi
+          done </work/elfs
+          $A --version
+          $A exec --proot /work/alpine.sif true
+          printf "Bootstrap: localimage\nFrom: /work/alpine.sif\n\n%%post\n    touch /built\n" >t.def
+          $A build --proot t.sif t.def
+          $A exec --proot t.sif test -f /built
+        '
+        echo "PASS ${IMAGE}"
   deploy:
     runs-on: ubuntu-slim
-    needs: build
+    needs: test
     permissions:
       contents: write
     steps:
     - run: |
         version=$(echo ${{ github.ref }} | sed 's@refs/tags/@@g')
-        echo "apptainer_version=${version}" >> $GITHUB_ENV
+        echo "apptainer_version=${version}" >> ${GITHUB_ENV}
     - parallel:
       - uses: actions/download-artifact@v8
         with:
-          name: archive-ubuntu2404-x86_64
+          name: archive-x86_64
       - uses: actions/download-artifact@v8
         with:
-          name: archive-ubuntu2404-aarch64
-      - uses: actions/download-artifact@v8
-        with:
-          name: archive-ubuntu2604-x86_64
-      - uses: actions/download-artifact@v8
-        with:
-          name: archive-ubuntu2604-aarch64
+          name: archive-aarch64
       - run: |
           cat << 'EOF' > install.bash
           #!/bin/bash
           set -euxo pipefail
-          curl -sSL https://github.com/wx257osn2/apptainer-proot/releases/download/${{ env.apptainer_version }}/ubuntu$(bash -c 'source /etc/os-release; echo ${VERSION_ID//./}')-$(uname -m).tar.zst | tar -C ${1:-"${HOME}/.local"} -x --use-compress-program="pzstd"
+          # the tarballs are built on Rocky Linux 8
+          GLIBC=$(getconf GNU_LIBC_VERSION 2>/dev/null || true)
+          GLIBC=${GLIBC#glibc }
+          if [ -z "${GLIBC}" ] || [ "$(printf '%s\n' 2.28 "${GLIBC}" | sort -V | head -n 1)" != 2.28 ]; then
+            echo "glibc 2.28 or later is required" >&2
+            exit 1
+          fi
+          curl -sSL https://github.com/wx257osn2/apptainer-proot/releases/download/${{ env.apptainer_version }}/$(uname -m).tar.zst | tar -C ${1:-"${HOME}/.local"} -x --use-compress-program="pzstd"
           EOF
       - run: |
           cat << 'EOF' > release_notes
+          Runs on x86_64 and aarch64 Linux with glibc 2.28 or later.
+          The sources of the bundled components under GPL or LGPL are in
+          `sources-<arch>.tar.zst`.
+
           ```
           $ which tar
           $ which curl
@@ -99,9 +273,9 @@ jobs:
     - uses: softprops/action-gh-release@v3
       with:
         files: |
-          ubuntu2404-x86_64.tar.zst
-          ubuntu2404-aarch64.tar.zst
-          ubuntu2604-x86_64.tar.zst
-          ubuntu2604-aarch64.tar.zst
+          x86_64.tar.zst
+          aarch64.tar.zst
+          sources-x86_64.tar.zst
+          sources-aarch64.tar.zst
           install.bash
         body_path: release_notes
