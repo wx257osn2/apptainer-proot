@@ -8,6 +8,7 @@ gocryptfs[_-]*
 PRoot-*
 squashfuse-*
 squashfs-tools-*
+!/dist/patches/*.patch
 *.m4
 *.pyc
 *.swp

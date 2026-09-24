@@ -11,14 +11,17 @@
 package proot
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/apptainer/apptainer/e2e/internal/e2e"
 	"github.com/apptainer/apptainer/e2e/internal/testhelper"
 	prootutil "github.com/apptainer/apptainer/internal/pkg/proot"
+	"github.com/apptainer/apptainer/internal/pkg/test/tool/require"
 )
 
 type ctx struct {
@@ -172,6 +175,73 @@ func (c ctx) testSandboxUntouched(t *testing.T) {
 	}
 }
 
+// testPathTranslation checks system calls whose paths proot translates,
+// through programs of the Debian image using them.
+func (c ctx) testPathTranslation(t *testing.T) {
+	requireProot(t)
+	e2e.EnsureDebianImage(t, c.env)
+
+	tmpDir, cleanup := e2e.MakeTempDir(t, c.env.TestDir, "proot-paths-", "")
+	t.Cleanup(func() {
+		if !t.Failed() {
+			cleanup(t)
+		}
+	})
+
+	// run runs script in its own /work directory, the working directory.
+	nbWorkDirs := 0
+	run := func(t *testing.T, profile e2e.Profile, proot bool, script string, ops ...e2e.ApptainerCmdOp) {
+		nbWorkDirs++
+		workDir := filepath.Join(tmpDir, fmt.Sprint(nbWorkDirs))
+		if err := os.Mkdir(workDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		args := []string{"--bind", workDir + ":/work", "--pwd", "/work", c.env.DebianImagePath, "bash", "-c", script}
+		if proot {
+			args = append([]string{"--proot"}, args...)
+		}
+		c.env.RunApptainer(
+			t,
+			append([]e2e.ApptainerCmdOp{
+				e2e.WithProfile(profile),
+				e2e.WithCommand("exec"),
+				e2e.WithArgs(args...),
+			}, ops...)...,
+		)
+	}
+
+	tests := []struct {
+		name   string
+		script string
+	}{
+		{
+			name:   "tar relative to working directory",
+			script: "mkdir -p a/b/c && echo x >a/b/c/f && tar -cf t.tar a && rm -r a && tar -xf t.tar && test -f a/b/c/f",
+		},
+		{
+			name:   "test -x relative to working directory",
+			script: "cd /usr/bin && test -x env",
+		},
+	}
+	for _, tt := range tests {
+		run(t, e2e.UserProfile, true, tt.script, e2e.AsSubtest(tt.name), e2e.ExpectExit(0))
+	}
+
+	// GNU tar refuses a symlink out of the directory it extracts to when it
+	// opens directories with openat2, which depends on the patches of the
+	// distribution, so the result in a user namespace is the reference.
+	t.Run("tar through symlink out of extraction directory", func(t *testing.T) {
+		require.UserNamespace(t)
+		script := "mkdir -p src/esc out outside && echo x >src/esc/f && tar -C src -cf e.tar esc/f && " +
+			"ln -s /work/outside out/esc && cd out && tar -xf ../e.tar 2>../err; " +
+			"echo \"status $? escaped '$(ls ../outside)' $(head -n 1 ../err)\""
+		var expected, stderr string
+		run(t, e2e.UserNamespaceProfile, false, script, e2e.ExpectExit(0, e2e.GetStreams(&expected, &stderr)))
+		run(t, e2e.UserProfile, true, script,
+			e2e.ExpectExit(0, e2e.ExpectOutput(e2e.ExactMatch, strings.TrimSuffix(expected, "\n"))))
+	})
+}
+
 func (c ctx) testBuild(t *testing.T) {
 	requireProot(t)
 	e2e.EnsureImage(t, c.env)
@@ -218,6 +288,7 @@ func E2ETests(env e2e.TestEnv) testhelper.Tests {
 	return testhelper.Tests{
 		"actions":           c.testActions,
 		"sandbox untouched": c.testSandboxUntouched,
+		"path translation":  c.testPathTranslation,
 		"build":             c.testBuild,
 	}
 }

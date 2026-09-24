@@ -1,0 +1,1064 @@
+Translate openat2, fchmodat2 and execveat.
+
+PRoot doesn't know these system calls, so the kernel gets the guest paths
+untranslated: relative paths are resolved from the actual working directory
+instead of the emulated one, and absolute paths from the host root.  For
+instance the GNU tar of Ubuntu 22.04 and later, with the fix of
+CVE-2025-45582, extracts to directories that it opens with
+openat2(AT_FDCWD, ..., RESOLVE_BENEATH).
+
+- openat2 is translated like openat.  The kernel would apply the RESOLVE_*
+  restrictions to the host path, which is absolute, so they are applied to
+  the guest path instead, component by component from the starting
+  directory, and a PRoot binding counts as a mount for RESOLVE_NO_XDEV.
+  The host path is then opened with RESOLVE_NO_SYMLINKS, so that a symlink
+  put in place of a directory in the meantime isn't followed.  Unlike the
+  kernel, the starting directory is identified by its path, so moving it
+  during the call isn't detected, RESOLVE_NO_XDEV detects the mounts inside
+  a binding by a change of device only, and refuses all the magic links.
+- fchmodat2 is translated like fchmodat, following AT_SYMLINK_NOFOLLOW, and
+  the fake root user of -0 handles it like fchmodat.
+- execveat is turned into execve.  With AT_EMPTY_PATH, a descriptor that
+  doesn't refer to a path, like a memfd, gets ENOSYS so that fexecve(3)
+  falls back to /proc/self/fd.  Other flags, like AT_EXECVE_CHECK, get
+  EINVAL rather than executing the program.
+- faccessat2 is added to the tables of arm64, arm and i386, where it wasn't
+  translated.
+
+This patch is under the license of PRoot, GPL-2.0-or-later.
+
+diff --git a/src/execve/auxv.c b/src/execve/auxv.c
+index 45f9d84..5f5aded 100644
+--- a/src/execve/auxv.c
++++ b/src/execve/auxv.c
+@@ -80,7 +80,7 @@ word_t get_elf_aux_vectors_address(const Tracee *tracee)
+ 	word_t data;
+ 
+ 	/* Sanity check: this works only in execve sysexit.  */
+-	assert(IS_IN_SYSEXIT2(tracee, PR_execve));
++	assert(IS_IN_SYSEXIT2(tracee, PR_execve) || IS_IN_SYSEXIT2(tracee, PR_execveat));
+ 
+ 	/* Right after execve, the stack layout is:
+ 	 *
+diff --git a/src/execve/enter.c b/src/execve/enter.c
+index 4ddb529..975d77c 100644
+--- a/src/execve/enter.c
++++ b/src/execve/enter.c
+@@ -29,8 +29,9 @@
+ #include <sys/mman.h>   /* PROT_*, */
+ #include <string.h>     /* strlen(3), strcpy(3), */
+ #include <stdlib.h>     /* getenv(3), */
+-#include <stdio.h>      /* fwrite(3), */
++#include <stdio.h>      /* fwrite(3), snprintf(3), */
+ #include <assert.h>     /* assert(3), */
++#include <fcntl.h>      /* AT_*, */
+ 
+ #include "execve/execve.h"
+ #include "execve/shebang.h"
+@@ -43,6 +44,7 @@
+ #include "tracee/tracee.h"
+ #include "syscall/syscall.h"
+ #include "syscall/sysnum.h"
++#include "tracee/reg.h"
+ #include "arch.h"
+ #include "cli/note.h"
+ 
+@@ -683,3 +685,108 @@ int translate_execve_enter(Tracee *tracee)
+ 
+ 	return 0;
+ }
++
++/**
++ * Put in @path the guest path of the program referred to by the
++ * @tracee's descriptor @fd.  This function returns -ENOSYS if there's
++ * no such path, as for a memfd, otherwise -errno if an error occured,
++ * or 0.
++ */
++static int get_exec_fd_path(Tracee *tracee, int fd, char path[PATH_MAX])
++{
++	char host_path[PATH_MAX];
++	char fd_path[64]; /* 64 > sizeof("/proc//fd/") + 2 * sizeof(#ULONG_MAX) */
++	struct stat fd_statl;
++	struct stat statl;
++	int status;
++
++	status = snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%d", tracee->pid, fd);
++	if (status < 0 || (size_t) status >= sizeof(fd_path))
++		return -EBADF;
++
++	if (stat(fd_path, &fd_statl) < 0)
++		return -EBADF;
++
++	/* The program is loaded by PRoot from its path, fexecve(3)
++	 * falls back to "/proc/self/fd/" on ENOSYS.  */
++	status = get_fd_path(tracee, fd, path);
++	if (status < 0)
++		return -ENOSYS;
++
++	status = translate_path(tracee, host_path, AT_FDCWD, path, true);
++	if (   status < 0
++	    || stat(host_path, &statl) < 0
++	    || statl.st_dev != fd_statl.st_dev
++	    || statl.st_ino != fd_statl.st_ino)
++		return -ENOSYS;
++
++	return 0;
++}
++
++/**
++ * Turn the current execveat(2) of @tracee into execve(2), then
++ * translate it with translate_execve_enter().  This function returns
++ * -errno if an error occured, otherwise 0.
++ */
++int translate_execveat_enter(Tracee *tracee)
++{
++	char user_path[PATH_MAX];
++	char host_path[PATH_MAX];
++	char base[PATH_MAX];
++	char path[PATH_MAX];
++	struct stat statl;
++	int dirfd;
++	int flags;
++	int status;
++
++	dirfd = peek_reg(tracee, CURRENT, SYSARG_1);
++	flags = peek_reg(tracee, CURRENT, SYSARG_5);
++
++	/* Other flags, like AT_EXECVE_CHECK, must not execute the
++	 * program.  */
++	if ((flags & ~(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW)) != 0)
++		return -EINVAL;
++
++	status = get_sysarg_path(tracee, user_path, SYSARG_2);
++	if (status < 0)
++		return status;
++
++	if (user_path[0] == '\0') {
++		if ((flags & AT_EMPTY_PATH) == 0)
++			return -ENOENT;
++
++		status = get_exec_fd_path(tracee, dirfd, path);
++		if (status < 0)
++			return status;
++	}
++	else if (user_path[0] != '/' && dirfd != AT_FDCWD) {
++		status = get_fd_path(tracee, dirfd, base);
++		if (status < 0)
++			return status;
++
++		status = join_paths(2, path, base, user_path);
++		if (status < 0)
++			return status;
++	}
++	else
++		strcpy(path, user_path);
++
++	if ((flags & AT_SYMLINK_NOFOLLOW) != 0 && user_path[0] != '\0') {
++		status = translate_path(tracee, host_path, AT_FDCWD, path, false);
++		if (status < 0)
++			return status;
++
++		if (lstat(host_path, &statl) == 0 && S_ISLNK(statl.st_mode))
++			return -ELOOP;
++	}
++
++	status = set_sysarg_path(tracee, path, SYSARG_1);
++	if (status < 0)
++		return status;
++
++	poke_reg(tracee, SYSARG_2, peek_reg(tracee, CURRENT, SYSARG_3));
++	poke_reg(tracee, SYSARG_3, peek_reg(tracee, CURRENT, SYSARG_4));
++	set_sysnum(tracee, PR_execve);
++
++	return translate_execve_enter(tracee);
++}
+diff --git a/src/execve/execve.h b/src/execve/execve.h
+index 4a1a409..a5e1cb2 100644
+--- a/src/execve/execve.h
++++ b/src/execve/execve.h
+@@ -30,6 +30,7 @@
+ #include "arch.h"
+ 
+ extern int translate_execve_enter(Tracee *tracee);
++extern int translate_execveat_enter(Tracee *tracee);
+ extern void translate_execve_exit(Tracee *tracee);
+ extern int translate_and_check_exec(Tracee *tracee, char host_path[PATH_MAX], const char *user_path);
+ 
+diff --git a/src/extension/care/care.c b/src/extension/care/care.c
+index cae1b28..7cb9bf4 100644
+--- a/src/extension/care/care.c
++++ b/src/extension/care/care.c
+@@ -583,7 +583,8 @@ int care_callback(Extension *extension, ExtensionEvent event,
+ 			handle_getdents(tracee, true);
+ 			break;
+ 
+-		case PR_execve: {
++		case PR_execve:
++		case PR_execveat: {
+ 			word_t result = peek_reg(tracee, CURRENT, SYSARG_RESULT);
+ 
+ 			/* Note: this can be done only before PRoot pushes the
+diff --git a/src/extension/fake_id0/fake_id0.c b/src/extension/fake_id0/fake_id0.c
+index 8de97d8..6f75b66 100644
+--- a/src/extension/fake_id0/fake_id0.c
++++ b/src/extension/fake_id0/fake_id0.c
+@@ -152,8 +152,10 @@ static FilteredSysnum filtered_sysnums[] = {
+ 	{ PR_chown32,		FILTER_SYSEXIT },
+ 	{ PR_chroot,		FILTER_SYSEXIT },
+ 	{ PR_execve,		FILTER_SYSEXIT },
++	{ PR_execveat,		FILTER_SYSEXIT },
+ 	{ PR_fchmod,		FILTER_SYSEXIT },
+ 	{ PR_fchmodat,		FILTER_SYSEXIT },
++	{ PR_fchmodat2,		FILTER_SYSEXIT },
+ 	{ PR_fchown,		FILTER_SYSEXIT },
+ 	{ PR_fchown32,		FILTER_SYSEXIT },
+ 	{ PR_fchownat,		FILTER_SYSEXIT },
+@@ -277,6 +279,17 @@ static void override_permissions(const Tracee *tracee, const char *path, bool is
+ 			node->mode = peek_reg(tracee, ORIGINAL, SYSARG_3);
+ 			break;
+ 
++		case PR_fchmodat2:
++			/* The mode of a symlink can't be changed, don't
++			 * change the one of its referee instead.  */
++			if ((peek_reg(tracee, ORIGINAL, SYSARG_4) & AT_SYMLINK_NOFOLLOW) != 0
++			    && lstat(path, &perms) == 0 && S_ISLNK(perms.st_mode)) {
++				TALLOC_FREE(node);
++				return;
++			}
++			node->mode = peek_reg(tracee, ORIGINAL, SYSARG_3);
++			break;
++
+ 		/* For stat syscalls: don't touch the mode of the final component.  */
+ 		case PR_fstatat64:
+ 		case PR_lstat:
+@@ -723,6 +736,7 @@ static int handle_sysexit_end(Tracee *tracee, Config *config)
+ 	case PR_fchown32:
+ 	case PR_lchown32:
+ 	case PR_fchmodat:
++	case PR_fchmodat2:
+ 	case PR_fchownat: {
+ 		word_t result;
+ 
+@@ -1041,7 +1055,7 @@ int fake_id0_callback(Extension *extension, ExtensionEvent event, intptr_t data1
+ 		struct stat mode;
+ 		int status;
+ 
+-		if ((int) result < 0 || sysnum != PR_execve)
++		if ((int) result < 0 || (sysnum != PR_execve && sysnum != PR_execveat))
+ 			return 0;
+ 
+ 		/* This has to be done before PRoot pushes the load
+diff --git a/src/extension/kompat/kompat.c b/src/extension/kompat/kompat.c
+index 102a9a0..fba2634 100644
+--- a/src/extension/kompat/kompat.c
++++ b/src/extension/kompat/kompat.c
+@@ -1063,7 +1063,7 @@ int kompat_callback(Extension *extension, ExtensionEvent event,
+ 
+ 		/* Note: this can be done only before PRoot pushes the
+ 		 * load script into tracee's stack.  */
+-		if ((int) result >= 0 && sysnum == PR_execve)
++		if ((int) result >= 0 && (sysnum == PR_execve || sysnum == PR_execveat))
+ 			adjust_elf_auxv(tracee, config);
+ 		return 0;
+ 	}
+diff --git a/src/path/canon.c b/src/path/canon.c
+index 4b3c006..9033df5 100644
+--- a/src/path/canon.c
++++ b/src/path/canon.c
+@@ -29,6 +29,7 @@
+ #include <string.h>    /* string(3), */
+ #include <assert.h>    /* assert(3), */
+ #include <stdio.h>     /* sscanf(3), */
++#include <sys/vfs.h>   /* statfs(2), */
+ 
+ #include "path/canon.h"
+ #include "path/path.h"
+@@ -37,6 +38,13 @@
+ #include "path/proc.h"
+ #include "extension/extension.h"
+ 
++#ifndef PROC_SUPER_MAGIC
++#define PROC_SUPER_MAGIC 0x9fa0
++#endif
++
++/* Inode number of the root directory of procfs.  */
++#define PROC_ROOT_INO 1
++
+ /**
+  * Put an end-of-string ('\0') right before the last component of @path.
+  */
+@@ -171,6 +179,125 @@ static inline int substitute_binding_stat(Tracee *tracee, Finality finality, uns
+ 	return (S_ISLNK(statl.st_mode) ? 1 : 0);
+ }
+ 
++/**
++ * Check that @guest_path is on the mount of the starting point of the
++ * @resolve restrictions, if they include RESOLVE_NO_XDEV.  This
++ * starting point is @guest_path itself if @start is true.  This
++ * function returns -errno if an error occured, otherwise 0.
++ */
++static int check_mount(const Tracee *tracee, Resolve *resolve, bool start,
++		const char guest_path[PATH_MAX])
++{
++	char host_path[PATH_MAX];
++	const Binding *binding;
++	struct stat statl;
++	int status;
++
++	if (resolve == NULL || (resolve->flags & RESOLVE_NO_XDEV) == 0)
++		return 0;
++
++	strcpy(host_path, guest_path);
++	status = substitute_binding(tracee, GUEST, host_path);
++	if (status < 0)
++		return status;
++
++	/* A missing component is reported by the caller, or created on
++	 * the current mount if it is final.  */
++	if (lstat(host_path, &statl) < 0)
++		return 0;
++
++	binding = get_binding(tracee, GUEST, guest_path);
++
++	if (start) {
++		resolve->binding = binding;
++		resolve->dev = statl.st_dev;
++	}
++	else if (binding != resolve->binding || statl.st_dev != resolve->dev)
++		return -EXDEV;
++
++	return 0;
++}
++
++/**
++ * Check whether a symlink in the guest directory @guest_dir is a
++ * "magic link" (see openat2(2)), that is, a symlink of procfs out of
++ * its root directory, which holds the ordinary ones like "self".
++ */
++static bool is_magic_link(const Tracee *tracee, const char guest_dir[PATH_MAX])
++{
++	char host_dir[PATH_MAX];
++	struct statfs statfsl;
++	struct stat statl;
++
++	strcpy(host_dir, guest_dir);
++	if (substitute_binding(tracee, GUEST, host_dir) < 0)
++		return false;
++
++	if (statfs(host_dir, &statfsl) < 0 || statfsl.f_type != PROC_SUPER_MAGIC)
++		return false;
++
++	return (stat(host_dir, &statl) < 0 || statl.st_ino != PROC_ROOT_INO);
++}
++
++/**
++ * Check that the @resolve restrictions allow to follow a symlink in
++ * the guest directory @guest_dir.  This function returns -errno if
++ * not, otherwise 0.
++ */
++static int check_link(const Tracee *tracee, const Resolve *resolve,
++		const char guest_dir[PATH_MAX])
++{
++	if (resolve == NULL)
++		return 0;
++
++	if ((resolve->flags & RESOLVE_NO_SYMLINKS) != 0)
++		return -ELOOP;
++
++	/* RESOLVE_NO_XDEV allows a magic link to a file on the same
++	 * mount, like one in procfs, which isn't worth the emulation.  */
++	if ((resolve->flags & (RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV
++				| RESOLVE_BENEATH | RESOLVE_IN_ROOT)) == 0
++	    || !is_magic_link(tracee, guest_dir))
++		return 0;
++
++	return ((resolve->flags & RESOLVE_NO_MAGICLINKS) != 0 ? -ELOOP : -EXDEV);
++}
++
++/**
++ * Copy in @guest_path the root directory of an absolute path,
++ * according to the @resolve restrictions.  This function returns
++ * -errno if an error occured, otherwise 0.
++ */
++static int resolve_root(const Resolve *resolve, char guest_path[PATH_MAX])
++{
++	if (resolve != NULL && (resolve->flags & RESOLVE_BENEATH) != 0)
++		return -EXDEV;
++
++	if (resolve != NULL && (resolve->flags & RESOLVE_IN_ROOT) != 0)
++		strcpy(guest_path, resolve->root);
++	else
++		strcpy(guest_path, "/");
++
++	return 0;
++}
++
++/**
++ * Remove the last component of @guest_path for a ".." component,
++ * according to the @resolve restrictions.  This function returns
++ * -errno if an error occured, otherwise 0.
++ */
++static int resolve_dotdot(const Tracee *tracee, Resolve *resolve, char guest_path[PATH_MAX])
++{
++	if (resolve != NULL
++	    && (resolve->flags & (RESOLVE_BENEATH | RESOLVE_IN_ROOT)) != 0
++	    && compare_paths(resolve->root, guest_path) == PATHS_ARE_EQUAL)
++		return ((resolve->flags & RESOLVE_BENEATH) != 0 ? -EXDEV : 0);
++
++	pop_component(guest_path);
++
++	return check_mount(tracee, resolve, false, guest_path);
++}
++
+ /**
+  * Copy in @guest_path the canonicalization (see `man 3 realpath`) of
+  * @user_path regarding to @tracee->root.  The path to canonicalize
+@@ -178,11 +305,12 @@ static inline int substitute_binding_stat(Tracee *tracee, Finality finality, uns
+  * component of @user_path is a link, it is dereferenced only if
+  * @deref_final is true -- it is useful for syscalls like lstat(2).
+  * The parameter @recursion_level should be set to 0 unless you know
+- * what you are doing. This function returns -errno if an error
++ * what you are doing. The path resolution is restricted by @resolve
++ * unless it is NULL. This function returns -errno if an error
+  * occured, otherwise it returns 0.
+  */
+-int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
+-		 char guest_path[PATH_MAX], unsigned int recursion_level)
++static int canonicalize2(Tracee *tracee, const char *user_path, bool deref_final,
++		 char guest_path[PATH_MAX], unsigned int recursion_level, Resolve *resolve)
+ {
+ 	char scratch_path[PATH_MAX];
+ 	char host_path[PATH_MAX];
+@@ -208,8 +336,11 @@ int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
+ 		if (guest_path[0] != '/')
+ 			return -EINVAL;
+ 	}
+-	else
+-		strcpy(guest_path, "/");
++	else {
++		status = resolve_root(resolve, guest_path);
++		if (status < 0)
++			return status;
++	}
+ 
+ 
+ 	/* Resolve bindings for the initial '/' component or user_path,
+@@ -219,6 +350,10 @@ int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
+ 	if (status < 0)
+ 		return status;
+ 
++	status = check_mount(tracee, resolve, recursion_level == 0, guest_path);
++	if (status < 0)
++		return status;
++
+ 	/* Canonicalize recursely 'user_path' into 'guest_path'.  */
+ 	cursor = user_path;
+ 	finality = NOT_FINAL;
+@@ -238,7 +373,9 @@ int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
+ 		}
+ 
+ 		if (strcmp(component, "..") == 0) {
+-			pop_component(guest_path);
++			status = resolve_dotdot(tracee, resolve, guest_path);
++			if (status < 0)
++				return status;
+ 			if (IS_FINAL(finality))
+ 				finality = FINAL_SLASH;
+ 			continue;
+@@ -264,6 +401,10 @@ int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
+ 		 * components.  Errors are explicitly ignored since
+ 		 * they should be handled by the caller. */
+ 		if (status <= 0 || (finality == FINAL_NORMAL && !deref_final)) {
++			status = check_mount(tracee, resolve, false, scratch_path);
++			if (status < 0)
++				return status;
++
+ 			strcpy(scratch_path, guest_path);
+ 			status = join_paths(2, guest_path, scratch_path, component);
+ 			if (status < 0)
+@@ -274,6 +415,10 @@ int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
+ 		/* It's a link, so we have to dereference *and*
+ 		 * canonicalize to ensure we are not going outside the
+ 		 * new root.  */
++		status = check_link(tracee, resolve, guest_path);
++		if (status < 0)
++			return status;
++
+ 		comparison = compare_paths("/proc", guest_path);
+ 		switch (comparison) {
+ 		case PATHS_ARE_EQUAL:
+@@ -286,7 +431,12 @@ int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
+ 			switch (status) {
+ 			case CANONICALIZE:
+ 				/* The symlink is already dereferenced,
+-				 * now canonicalize it.  */
++				 * now canonicalize it.  Unlike this
++				 * emulation, "/proc/self" is relative,
++				 * which RESOLVE_BENEATH doesn't refuse.  */
++				if (resolve != NULL && comparison == PATHS_ARE_EQUAL)
++					memmove(scratch_path, scratch_path + strlen("/proc/"),
++						strlen(scratch_path) - strlen("/proc/") + 1);
+ 				goto canon;
+ 
+ 			case DONT_CANONICALIZE:
+@@ -325,7 +475,7 @@ int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
+ 		 * is/contains a link, moreover if it is not an
+ 		 * absolute link then it is relative to
+ 		 * 'guest_path'. */
+-		status = canonicalize(tracee, scratch_path, true, guest_path, recursion_level + 1);
++		status = canonicalize2(tracee, scratch_path, true, guest_path, recursion_level + 1, resolve);
+ 		if (status < 0)
+ 			return status;
+ 
+@@ -370,3 +520,23 @@ int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
+ 
+ 	return 0;
+ }
++
++/**
++ * Like canonicalize2(), without restrictions.
++ */
++int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
++		 char guest_path[PATH_MAX], unsigned int recursion_level)
++{
++	return canonicalize2(tracee, user_path, deref_final, guest_path, recursion_level, NULL);
++}
++
++/**
++ * Like canonicalize(), but with the path resolution restricted by
++ * @resolve, where @resolve->root is also the base of a relative
++ * @user_path in @guest_path.
++ */
++int canonicalize_resolve(Tracee *tracee, const char *user_path, bool deref_final,
++			char guest_path[PATH_MAX], Resolve *resolve)
++{
++	return canonicalize2(tracee, user_path, deref_final, guest_path, 0, resolve);
++}
+diff --git a/src/path/canon.h b/src/path/canon.h
+index fa6546f..8006d76 100644
+--- a/src/path/canon.h
++++ b/src/path/canon.h
+@@ -24,11 +24,42 @@
+ #define CANON_H
+ 
+ #include <stdbool.h>
++#include <stdint.h>
+ #include <limits.h>
++#include <sys/types.h>
+ 
+ #include "tracee/tracee.h"
++#include "path/binding.h"
++
++/* See openat2(2), <linux/openat2.h> doesn't exist on older systems.  */
++#ifndef RESOLVE_NO_XDEV
++#define RESOLVE_NO_XDEV		0x01
++#define RESOLVE_NO_MAGICLINKS	0x02
++#define RESOLVE_NO_SYMLINKS	0x04
++#define RESOLVE_BENEATH		0x08
++#define RESOLVE_IN_ROOT		0x10
++#define RESOLVE_CACHED		0x20
++#endif
++
++/* Restrictions of the path resolution, see openat2(2).  */
++typedef struct {
++	/* RESOLVE_* flags.  */
++	uint64_t flags;
++
++	/* Guest path of the directory the resolution is scoped to by
++	 * RESOLVE_BENEATH and RESOLVE_IN_ROOT.  */
++	const char *root;
++
++	/* Mount of the starting point, which RESOLVE_NO_XDEV forbids
++	 * to leave: from the guest point-of-view, a binding is a
++	 * mount too.  */
++	const Binding *binding;
++	dev_t dev;
++} Resolve;
+ 
+ extern int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
+ 			char guest_path[PATH_MAX], unsigned int nb_recursion);
++extern int canonicalize_resolve(Tracee *tracee, const char *user_path, bool deref_final,
++				char guest_path[PATH_MAX], Resolve *resolve);
+ 
+ #endif /* CANON_H */
+diff --git a/src/path/path.c b/src/path/path.c
+index bc6c49a..df4b277 100644
+--- a/src/path/path.c
++++ b/src/path/path.c
+@@ -307,41 +307,60 @@ int readlink_proc_pid_fd(pid_t pid, int fd, char path[PATH_MAX])
+ 	return 0;
+ }
+ 
++/**
++ * Put in @path the guest path of the file referred to by the
++ * @tracee's descriptor @fd.  This function returns -errno if an error
++ * occured, otherwise 0.
++ */
++int get_fd_path(Tracee *tracee, int fd, char path[PATH_MAX])
++{
++	int status;
++
++	/* /proc/@tracee->pid/fd/@fd -> path.  */
++	status = readlink_proc_pid_fd(tracee->pid, fd, path);
++	if (status < 0)
++		return status;
++
++	/* Named file descriptors may reference special
++	 * objects like pipes, sockets, inodes, ...  Such
++	 * objects do not belong to the file-system.  */
++	if (path[0] != '/')
++		return -ENOTDIR;
++
++	/* Remove the leading "root" part of the base
++	 * (required!). */
++	status = detranslate_path(tracee, path, NULL);
++	if (status < 0)
++		return status;
++
++	return 0;
++}
++
+ /**
+  * Copy in @result the equivalent of "@tracee->root + canon(@dir_fd +
+  * @user_path)".  If @user_path is not absolute then it is relative to
+  * the directory referred by the descriptor @dir_fd (AT_FDCWD is for
+  * the current working directory).  See the documentation of
+- * canonicalize() for the meaning of @deref_final.  This function
+- * returns -errno if an error occured, otherwise 0.
++ * canonicalize() for the meaning of @deref_final.  The path
++ * resolution is restricted by @resolve unless it is NULL, where the
++ * directory referred by @dir_fd is the root of the restrictions.
++ * This function returns -errno if an error occured, otherwise 0.
+  */
+-int translate_path(Tracee *tracee, char result[PATH_MAX], int dir_fd,
+-		const char *user_path, bool deref_final)
++static int translate_path3(Tracee *tracee, char result[PATH_MAX], int dir_fd,
++		const char *user_path, bool deref_final, Resolve *resolve)
+ {
+ 	char guest_path[PATH_MAX];
+ 	int status;
+ 
+-	/* Use "/" as the base if it is an absolute guest path. */
+-	if (user_path[0] == '/') {
++	/* Use "/" as the base if it is an absolute guest path, unless
++	 * RESOLVE_IN_ROOT makes it relative to @dir_fd. */
++	if (user_path[0] == '/' && (resolve == NULL || (resolve->flags & RESOLVE_IN_ROOT) == 0)) {
+ 		strcpy(result, "/");
+ 	}
+ 	/* It is relative to a directory referred by a descriptor, see
+ 	 * openat(2) for details. */
+ 	else if (dir_fd != AT_FDCWD) {
+-		/* /proc/@tracee->pid/fd/@dir_fd -> result.  */
+-		status = readlink_proc_pid_fd(tracee->pid, dir_fd, result);
+-		if (status < 0)
+-			return status;
+-
+-		/* Named file descriptors may reference special
+-		 * objects like pipes, sockets, inodes, ...  Such
+-		 * objects do not belong to the file-system.  */
+-		if (result[0] != '/')
+-			return -ENOTDIR;
+-
+-		/* Remove the leading "root" part of the base
+-		 * (required!). */
+-		status = detranslate_path(tracee, result, NULL);
++		status = get_fd_path(tracee, dir_fd, result);
+ 		if (status < 0)
+ 			return status;
+ 	}
+@@ -361,18 +380,30 @@ int translate_path(Tracee *tracee, char result[PATH_MAX], int dir_fd,
+ 	if (status > 0)
+ 		goto skip;
+ 
+-	/* So far "result" was used as a base path, it's time to join
+-	 * it to the user path.  */
+ 	assert(result[0] == '/');
+-	status = join_paths(2, guest_path, result, user_path);
+-	if (status < 0)
+-		return status;
+-	strcpy(result, "/");
++	if (resolve != NULL) {
++		/* The restrictions start from the base, so it isn't
++		 * joined to the user path unlike below.  */
++		strcpy(guest_path, result);
++		resolve->root = guest_path;
+ 
+-	/* Canonicalize regarding the new root. */
+-	status = canonicalize(tracee, guest_path, deref_final, result, 0);
+-	if (status < 0)
+-		return status;
++		status = canonicalize_resolve(tracee, user_path, deref_final, result, resolve);
++		if (status < 0)
++			return status;
++	}
++	else {
++		/* So far "result" was used as a base path, it's time to join
++		 * it to the user path.  */
++		status = join_paths(2, guest_path, result, user_path);
++		if (status < 0)
++			return status;
++		strcpy(result, "/");
++
++		/* Canonicalize regarding the new root. */
++		status = canonicalize(tracee, guest_path, deref_final, result, 0);
++		if (status < 0)
++			return status;
++	}
+ 
+ 	/* Final binding substitution to convert "result" into a host
+ 	 * path, since canonicalize() works from the guest
+@@ -392,6 +423,27 @@ skip:
+ 	return 0;
+ }
+ 
++/**
++ * See translate_path3(), without restrictions.
++ */
++int translate_path(Tracee *tracee, char result[PATH_MAX], int dir_fd,
++		const char *user_path, bool deref_final)
++{
++	return translate_path3(tracee, result, dir_fd, user_path, deref_final, NULL);
++}
++
++/**
++ * See translate_path3(), with the restrictions of the RESOLVE_*
++ * @flags of openat2(2).
++ */
++int translate_path_resolve(Tracee *tracee, char result[PATH_MAX], int dir_fd,
++			const char *user_path, bool deref_final, uint64_t flags)
++{
++	Resolve resolve = { .flags = flags };
++
++	return translate_path3(tracee, result, dir_fd, user_path, deref_final, &resolve);
++}
++
+ /**
+  * Remove/substitute the leading part of a "translated" @path.  It
+  * returns 0 if no transformation is required (ie. symmetric binding),
+diff --git a/src/path/path.h b/src/path/path.h
+index d455894..6372872 100644
+--- a/src/path/path.h
++++ b/src/path/path.h
+@@ -27,6 +27,7 @@
+ #include <fcntl.h> /* AT_FDCWD, */
+ #include <limits.h> /* PATH_MAX, */
+ #include <stdbool.h>
++#include <stdint.h> /* uint64_t, */
+ 
+ #include "tracee/tracee.h"
+ 
+@@ -78,6 +79,9 @@ extern void chop_finality(char *path);
+ 
+ extern int translate_path(Tracee *tracee, char host_path[PATH_MAX],
+ 			int dir_fd, const char *guest_path, bool deref_final);
++extern int translate_path_resolve(Tracee *tracee, char host_path[PATH_MAX],
++				int dir_fd, const char *guest_path, bool deref_final, uint64_t flags);
++extern int get_fd_path(Tracee *tracee, int fd, char path[PATH_MAX]);
+ 
+ extern int detranslate_path(Tracee *tracee, char path[PATH_MAX], const char t_referrer[PATH_MAX]);
+ extern bool belongs_to_guestfs(const Tracee *tracee, const char *path);
+diff --git a/src/syscall/enter.c b/src/syscall/enter.c
+index 6bee61a..ead46d2 100644
+--- a/src/syscall/enter.c
++++ b/src/syscall/enter.c
+@@ -27,6 +27,8 @@
+ #include <fcntl.h>       /* AT_FDCWD, */
+ #include <limits.h>      /* PATH_MAX, */
+ #include <string.h>      /* strcpy */
++#include <stdint.h>      /* uint64_t, */
++#include <unistd.h>      /* sysconf(3), */
+ #include <sys/prctl.h>   /* PR_SET_DUMPABLE */
+ #include "syscall/syscall.h"
+ #include "syscall/sysnum.h"
+@@ -84,6 +86,65 @@ static int translate_sysarg(Tracee *tracee, Reg reg, Type type)
+ 	return translate_path2(tracee, AT_FDCWD, old_path, reg, type);
+ }
+ 
++/* See openat2(2), <linux/openat2.h> doesn't exist on older systems.  */
++typedef struct {
++	uint64_t flags;
++	uint64_t mode;
++	uint64_t resolve;
++} OpenHow;
++
++#define RESOLVE_ALL (RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS \
++		| RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_CACHED)
++
++/**
++ * Copy in @how the open_how structure of @size bytes pointed to by the
++ * @reg argument of the current syscall, and check it as the kernel
++ * does.  This function returns -errno if an error occured, otherwise
++ * 0.
++ */
++static int get_sysarg_open_how(const Tracee *tracee, OpenHow *how, Reg reg, word_t size)
++{
++	unsigned char chunk[256];
++	word_t address;
++	word_t offset;
++	word_t length;
++	word_t i;
++	int status;
++
++	if (size < sizeof(OpenHow))
++		return -EINVAL;
++
++	if (size > (word_t) sysconf(_SC_PAGESIZE))
++		return -E2BIG;
++
++	address = peek_reg(tracee, CURRENT, reg);
++	status = read_data(tracee, how, address, sizeof(OpenHow));
++	if (status < 0)
++		return status;
++
++	/* Fields unknown to PRoot can't be translated, a kernel which
++	 * doesn't know them accepts them only if they are unused.  */
++	for (offset = sizeof(OpenHow); offset < size; offset += length) {
++		length = size - offset < sizeof(chunk) ? size - offset : sizeof(chunk);
++		status = read_data(tracee, chunk, address + offset, length);
++		if (status < 0)
++			return status;
++
++		for (i = 0; i < length; i++) {
++			if (chunk[i] != 0)
++				return -E2BIG;
++		}
++	}
++
++	if ((how->resolve & ~RESOLVE_ALL) != 0)
++		return -EINVAL;
++
++	if ((how->resolve & RESOLVE_BENEATH) != 0 && (how->resolve & RESOLVE_IN_ROOT) != 0)
++		return -EINVAL;
++
++	return 0;
++}
++
+ /**
+  * Translate the input arguments of the current @tracee's syscall in the
+  * @tracee->pid process area. This function sets @tracee->status to
+@@ -125,6 +186,10 @@ int translate_syscall_enter(Tracee *tracee)
+ 		status = translate_execve_enter(tracee);
+ 		break;
+ 
++	case PR_execveat:
++		status = translate_execveat_enter(tracee);
++		break;
++
+ 	case PR_ptrace:
+ 		status = translate_ptrace_enter(tracee);
+ 		break;
+@@ -392,6 +457,7 @@ int translate_syscall_enter(Tracee *tracee)
+ 		break;
+ 
+ 	case PR_fchownat:
++	case PR_fchmodat2:
+ 	case PR_fstatat64:
+ 	case PR_newfstatat:
+ 	case PR_statx:
+@@ -517,6 +583,56 @@ int translate_syscall_enter(Tracee *tracee)
+ 			status = translate_path2(tracee, dirfd, path, SYSARG_2, REGULAR);
+ 		break;
+ 
++	case PR_openat2: {
++		OpenHow how;
++		Type type;
++
++		dirfd = peek_reg(tracee, CURRENT, SYSARG_1);
++
++		status = get_sysarg_open_how(tracee, &how, SYSARG_3, peek_reg(tracee, CURRENT, SYSARG_4));
++		if (status < 0)
++			break;
++
++		status = get_sysarg_path(tracee, path, SYSARG_2);
++		if (status < 0)
++			break;
++
++		if (   ((how.flags & O_NOFOLLOW) != 0)
++			|| ((how.flags & O_EXCL) != 0 && (how.flags & O_CREAT) != 0))
++			type = SYMLINK;
++		else
++			type = REGULAR;
++
++		if ((how.resolve & ~RESOLVE_CACHED) == 0)
++			status = translate_path2(tracee, dirfd, path, SYSARG_2, type);
++		else if (path[0] != '\0') {
++			/* The kernel would apply the restrictions to the
++			 * host path, which is absolute, so they are
++			 * applied to the guest path instead.  */
++			status = translate_path_resolve(tracee, newpath, dirfd, path,
++							type != SYMLINK, how.resolve);
++			if (status < 0)
++				break;
++
++			status = set_sysarg_path(tracee, newpath, SYSARG_2);
++
++			/* The host path has no symlinks, except a final
++			 * one that isn't followed.  This ensures none is
++			 * put in place of a directory in the meantime.  */
++			how.resolve = RESOLVE_NO_SYMLINKS | (how.resolve & RESOLVE_CACHED);
++		}
++		if (status < 0)
++			break;
++
++		/* The structure given by the tracee isn't modified.  */
++		status = set_sysarg_data(tracee, &how, sizeof(how), SYSARG_3);
++		if (status < 0)
++			break;
++
++		poke_reg(tracee, SYSARG_4, sizeof(how));
++		break;
++	}
++
+ 	case PR_readlinkat:
+ 	case PR_unlinkat:
+ 	case PR_mkdirat:
+diff --git a/src/syscall/exit.c b/src/syscall/exit.c
+index 0491ee6..7fccaed 100644
+--- a/src/syscall/exit.c
++++ b/src/syscall/exit.c
+@@ -428,6 +428,7 @@ void translate_syscall_exit(Tracee *tracee)
+ #endif
+ 
+ 	case PR_execve:
++	case PR_execveat:
+ 		translate_execve_exit(tracee);
+ 		goto end;
+ 
+diff --git a/src/syscall/seccomp.c b/src/syscall/seccomp.c
+index 792c79e..1020e36 100644
+--- a/src/syscall/seccomp.c
++++ b/src/syscall/seccomp.c
+@@ -343,9 +343,11 @@ static FilteredSysnum proot_sysnums[] = {
+ 	{ PR_connect,		0 },
+ 	{ PR_creat,		0 },
+ 	{ PR_execve,		FILTER_SYSEXIT },
++	{ PR_execveat,		FILTER_SYSEXIT },
+ 	{ PR_faccessat,		0 },
+ 	{ PR_fchdir,		FILTER_SYSEXIT },
+ 	{ PR_fchmodat,		0 },
++	{ PR_fchmodat2,		0 },
+ 	{ PR_fchownat,		0 },
+ 	{ PR_fstatat64,		0 },
+ 	{ PR_futimesat,		0 },
+@@ -376,6 +378,7 @@ static FilteredSysnum proot_sysnums[] = {
+ 	{ PR_oldstat,		0 },
+ 	{ PR_open,		0 },
+ 	{ PR_openat,		0 },
++	{ PR_openat2,		0 },
+ 	{ PR_pivot_root,	0 },
+ 	{ PR_prctl, 		0 },
+ 	{ PR_prlimit64,		FILTER_SYSEXIT },
+diff --git a/src/syscall/syscall.c b/src/syscall/syscall.c
+index 8991a40..5bc8512 100644
+--- a/src/syscall/syscall.c
++++ b/src/syscall/syscall.c
+@@ -68,7 +68,7 @@ int get_sysarg_path(const Tracee *tracee, char path[PATH_MAX], Reg reg)
+  * syscall points to this new block.  This function returns -errno if
+  * an error occured, otherwise 0.
+  */
+-static int set_sysarg_data(Tracee *tracee, const void *tracer_ptr, word_t size, Reg reg)
++int set_sysarg_data(Tracee *tracee, const void *tracer_ptr, word_t size, Reg reg)
+ {
+ 	word_t tracee_ptr;
+ 	int status;
+diff --git a/src/syscall/syscall.h b/src/syscall/syscall.h
+index f99bd94..e255cc8 100644
+--- a/src/syscall/syscall.h
++++ b/src/syscall/syscall.h
+@@ -30,6 +30,7 @@
+ 
+ extern int get_sysarg_path(const Tracee *tracee, char path[PATH_MAX], Reg reg);
+ extern int set_sysarg_path(Tracee *tracee, const char path[PATH_MAX], Reg reg);
++extern int set_sysarg_data(Tracee *tracee, const void *tracer_ptr, word_t size, Reg reg);
+ 
+ extern void translate_syscall(Tracee *tracee);
+ extern int  translate_syscall_enter(Tracee *tracee);
+diff --git a/src/syscall/sysnums-arm.h b/src/syscall/sysnums-arm.h
+index dfd512f..ad4b608 100644
+--- a/src/syscall/sysnums-arm.h
++++ b/src/syscall/sysnums-arm.h
+@@ -339,6 +339,10 @@ static const Sysnum sysnums_arm[] = {
+ 	[ 380 ] = PR_sched_setattr,
+ 	[ 381 ] = PR_sched_getattr,
+ 	[ 382 ] = PR_renameat2,
++	[ 387 ] = PR_execveat,
+ 	[ 397 ] = PR_statx,
+ 	[ 412 ] = PR_utimensat_time64,
++	[ 437 ] = PR_openat2,
++	[ 439 ] = PR_faccessat2,
++	[ 452 ] = PR_fchmodat2,
+ };
+diff --git a/src/syscall/sysnums-arm64.h b/src/syscall/sysnums-arm64.h
+index dfb9889..94e9c2d 100644
+--- a/src/syscall/sysnums-arm64.h
++++ b/src/syscall/sysnums-arm64.h
+@@ -263,5 +263,9 @@ static const Sysnum sysnums_arm64[] = {
+ 	[ 274 ] = PR_sched_setattr,
+ 	[ 275 ] = PR_sched_getattr,
+ 	[ 276 ] = PR_renameat2,
++	[ 281 ] = PR_execveat,
+ 	[ 291 ] = PR_statx,
++	[ 437 ] = PR_openat2,
++	[ 439 ] = PR_faccessat2,
++	[ 452 ] = PR_fchmodat2,
+ };
+diff --git a/src/syscall/sysnums-i386.h b/src/syscall/sysnums-i386.h
+index 3bbb70e..0e1971b 100644
+--- a/src/syscall/sysnums-i386.h
++++ b/src/syscall/sysnums-i386.h
+@@ -351,6 +351,10 @@ static const Sysnum sysnums_i386[] = {
+ 	[ 351 ] = PR_sched_setattr,
+ 	[ 352 ] = PR_sched_getattr,
+ 	[ 353 ] = PR_renameat2,
++	[ 358 ] = PR_execveat,
+ 	[ 383 ] = PR_statx,
+ 	[ 412 ] = PR_utimensat_time64,
++	[ 437 ] = PR_openat2,
++	[ 439 ] = PR_faccessat2,
++	[ 452 ] = PR_fchmodat2,
+ };
+diff --git a/src/syscall/sysnums-x32.h b/src/syscall/sysnums-x32.h
+index 448c699..4141aac 100644
+--- a/src/syscall/sysnums-x32.h
++++ b/src/syscall/sysnums-x32.h
+@@ -277,7 +277,9 @@ static const Sysnum sysnums_x32[] = {
+ 	[ 315 ] = PR_sched_getattr,
+ 	[ 316 ] = PR_renameat2,
+ 	[ 332 ] = PR_statx,
++	[ 437 ] = PR_openat2,
+ 	[ 439 ] = PR_faccessat2,
++	[ 452 ] = PR_fchmodat2,
+ 	[ 512 ] = PR_rt_sigaction,
+ 	[ 513 ] = PR_rt_sigreturn,
+ 	[ 514 ] = PR_ioctl,
+@@ -309,4 +311,5 @@ static const Sysnum sysnums_x32[] = {
+ 	[ 540 ] = PR_process_vm_writev,
+ 	[ 541 ] = PR_setsockopt,
+ 	[ 542 ] = PR_getsockopt,
++	[ 545 ] = PR_execveat,
+ };
+diff --git a/src/syscall/sysnums-x86_64.h b/src/syscall/sysnums-x86_64.h
+index 92229f8..f2167c6 100644
+--- a/src/syscall/sysnums-x86_64.h
++++ b/src/syscall/sysnums-x86_64.h
+@@ -318,6 +318,9 @@ static const Sysnum sysnums_x86_64[] = {
+ 	[ 314 ] = PR_sched_setattr,
+ 	[ 315 ] = PR_sched_getattr,
+ 	[ 316 ] = PR_renameat2,
++	[ 322 ] = PR_execveat,
+ 	[ 332 ] = PR_statx,
++	[ 437 ] = PR_openat2,
+ 	[ 439 ] = PR_faccessat2,
++	[ 452 ] = PR_fchmodat2,
+ };
+diff --git a/src/syscall/sysnums.list b/src/syscall/sysnums.list
+index 1d6e666..650cae7 100644
+--- a/src/syscall/sysnums.list
++++ b/src/syscall/sysnums.list
+@@ -431,3 +431,6 @@ SYSNUM(x32_waitid)
+ SYSNUM(x32_writev)
+ SYSNUM(statx)
+ SYSNUM(utimensat_time64)
++SYSNUM(execveat)
++SYSNUM(fchmodat2)
++SYSNUM(openat2)

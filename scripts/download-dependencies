@@ -4,7 +4,8 @@
 #   For website terms of use, trademark policy, privacy policy and other
 #   project policies see https://lfprojects.org/policies
 #
-# Download additional source urls listed in rpm into directory in $1.
+# Download additional source urls listed in rpm into directory in $1,
+# and copy there the ones found in dist/patches.
 # Assumes being run from the top of the apptainer source directory.
 
 if [ -n "$2" ] || [[ "$1" = -* ]]; then
@@ -55,6 +56,10 @@ sed -n -e '/^# URL:/{s/^# //;s/%%/%/g;p}' -e 's/^Source[1-9][0-9]*: //p' -e 's/^
                 fi
                 ;;
         esac
+    fi
+    if [ -f "dist/patches/$LINE" ]; then
+        cp "dist/patches/$LINE" "$DIR/$LINE"
+        continue
     fi
     if [ -n "$GITHUB_TOKEN" ] && [[ "$URL" = *github.com/*.patch ]]; then
         # use github API instead because the public URL downloads

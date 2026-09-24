@@ -78,6 +78,8 @@ Source14: https://github.com/plougher/squashfs-tools/archive/%{squashfs_tools_ve
 %endif
 %if "%{?PRoot_version}" != ""
 Source15: https://github.com/rootless-containers/PRoot/archive/v%{PRoot_version}/PRoot-%{PRoot_version}.tar.gz
+# from dist/patches
+Patch151: PRoot-openat2-fchmodat2-execveat.patch
 %endif
 
 # This Conflicts is in case someone tries to install the main apptainer

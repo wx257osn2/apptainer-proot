@@ -32,7 +32,13 @@ Changes since 1.5.x
   `proot-loader-m32`. They are given to proot through a path under `/proc`,
   because the uutils coreutils of Ubuntu 25.10 and later otherwise take the
   name of the loader, which proot executes in place of each program, for
-  the name of the utility to run.
+  the name of the utility to run. The bundled PRoot is patched to translate
+  the paths of the `openat2`, `fchmodat2` and `execveat` system calls, and
+  of `faccessat2` on arm64 and for 32-bit programs, which it passed to the
+  kernel as they were. The `RESOLVE_*` restrictions of `openat2` are
+  applied from the point of view of the container. For instance, the GNU
+  tar of Ubuntu 22.04 and later failed to extract archives relative to the
+  working directory.
 - Add support for building data partitions from tar files using
   `apptainer build --data image.sif input.tar*`. Supports uncompressed (.tar) and
   compressed (.tar.gz, .tar.xz, .tar.zst, .tar.lzo) archives, with decompression
