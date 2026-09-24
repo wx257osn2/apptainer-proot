@@ -497,6 +497,13 @@ LD_LIBRARY_PATH=$GGPARENT/utils/lib PATH=$GGPARENT/utils/bin:$PATH ${_WRAPPER_EX
 !EOF!
 chmod +x libexec/apptainer/bin/.wrapper
 for TOOL in libexec/apptainer/bin/*; do
+	case "${TOOL##*/}" in
+		# statically linked, and executed in the container or by proot
+		# rather than on the host, so they can't go through the wrapper
+		proot-init|proot-loader*)
+			continue
+			;;
+	esac
 	mv "$TOOL" libexec/apptainer/libexec
 	ln -s .wrapper "$TOOL"
 done

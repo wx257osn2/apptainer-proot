@@ -262,6 +262,10 @@ install -m 755 squashfs-tools-%{squashfs_tools_version}/squashfs-tools/unsquashf
 
 %if "%{?PRoot_version}" != ""
 install -m 755 PRoot-%{PRoot_version}/src/proot %{buildroot}%{_libexecdir}/%{name}/bin/proot
+install -m 755 PRoot-%{PRoot_version}/src/loader/loader %{buildroot}%{_libexecdir}/%{name}/bin/proot-loader
+%ifarch x86_64
+install -m 755 PRoot-%{PRoot_version}/src/loader/loader-m32 %{buildroot}%{_libexecdir}/%{name}/bin/proot-loader-m32
+%endif
 %endif
 
 %post
@@ -338,6 +342,10 @@ fi
 %endif
 %if "%{?PRoot_version}" != ""
 %{_libexecdir}/%{name}/bin/proot
+%{_libexecdir}/%{name}/bin/proot-loader
+%ifarch x86_64
+%{_libexecdir}/%{name}/bin/proot-loader-m32
+%endif
 %endif
 %{_libexecdir}/%{name}/cni
 %{_libexecdir}/%{name}/lib

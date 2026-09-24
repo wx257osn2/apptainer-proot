@@ -27,7 +27,12 @@ Changes since 1.5.x
   privileges are refused: instances, `--pid`, `--ipc`, `--net`, `--uts`,
   `--hostname`, cgroups, `--security`, `--fusemount`, `--nvccli`, CDI
   device hooks, and encrypted builds. Read-only binds are not enforced. A new
-  `proot-init` helper is installed in `libexec/apptainer/bin`.
+  `proot-init` helper is installed in `libexec/apptainer/bin`, together with
+  the loaders of the bundled PRoot, `proot-loader` and on x86_64
+  `proot-loader-m32`. They are given to proot through a path under `/proc`,
+  because the uutils coreutils of Ubuntu 25.10 and later otherwise take the
+  name of the loader, which proot executes in place of each program, for
+  the name of the utility to run.
 - Add support for building data partitions from tar files using
   `apptainer build --data image.sif input.tar*`. Supports uncompressed (.tar) and
   compressed (.tar.gz, .tar.xz, .tar.zst, .tar.lzo) archives, with decompression

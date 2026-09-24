@@ -40,3 +40,13 @@ for CMD in squashfs-tools-*/squashfs-tools/{mksquashfs,unsquashfs} squashfuse-*/
     fi
     cp -f $CMD $DIR
 done
+# The PRoot loaders are installed next to proot, which is the only one
+# using them, under names identifying them. The 32-bit loader only exists
+# on architectures where PRoot supports 32-bit programs.
+for LOADER in PRoot-*/src/loader/loader{,-m32}; do
+    if [ ! -f "$LOADER" ]; then
+        echo "$LOADER not found, skipping" >&2
+        continue
+    fi
+    cp -f $LOADER $DIR/proot-${LOADER##*/}
+done

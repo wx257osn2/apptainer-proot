@@ -329,6 +329,50 @@ func TestProotGuestBinds(t *testing.T) {
 	assert.Assert(t, fi.Mode().IsRegular())
 }
 
+func TestProotLoaderEnv(t *testing.T) {
+	tests := []struct {
+		name    string
+		loaders []string
+		want    func(dir string) []string
+	}{
+		{
+			name: "no loader",
+		},
+		{
+			name:    "64-bit loader",
+			loaders: []string{"proot-loader"},
+			want: func(dir string) []string {
+				return []string{"PROOT_LOADER=/proc/self/root" + dir + "/proot-loader"}
+			},
+		},
+		{
+			name:    "64-bit and 32-bit loaders",
+			loaders: []string{"proot-loader", "proot-loader-m32"},
+			want: func(dir string) []string {
+				return []string{
+					"PROOT_LOADER=/proc/self/root" + dir + "/proot-loader",
+					"PROOT_LOADER_32=/proc/self/root" + dir + "/proot-loader-m32",
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			assert.NilError(t, os.WriteFile(filepath.Join(dir, "proot"), nil, 0o755))
+			for _, l := range tt.loaders {
+				assert.NilError(t, os.WriteFile(filepath.Join(dir, l), nil, 0o755))
+			}
+			var want []string
+			if tt.want != nil {
+				want = tt.want(dir)
+			}
+			got := prootLoaderEnv(filepath.Join(dir, "proot"))
+			assert.Assert(t, reflect.DeepEqual(got, want), "env %v, want %v", got, want)
+		})
+	}
+}
+
 func TestProotLayeredPath(t *testing.T) {
 	o, _ := newTestProotOps(t)
 	assert.NilError(t, o.Mount("overlay", o.finalPath, "overlay", 0, "lowerdir="+o.layerPath+":"+o.rootFsPath))

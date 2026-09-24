@@ -546,6 +546,7 @@ func (e *EngineOperations) runProot(ops *prootOps, prootPath, initPath, sessionP
 	// destinations in a writable root filesystem, such as a sandbox shared
 	// with other containers, instead of in its temporary directory.
 	cmd.Env = []string{"PROOT_TMP_DIR=" + prootTmp, "PROOT_DONT_POLLUTE_ROOTFS=1", sylog.GetEnvVar()}
+	cmd.Env = append(cmd.Env, prootLoaderEnv(prootPath)...)
 
 	signals := make(chan os.Signal, 16)
 	signal.Notify(signals)
@@ -628,6 +629,37 @@ func (e *EngineOperations) runProot(ops *prootOps, prootPath, initPath, sessionP
 			}
 		}
 	}
+}
+
+// prootLoaders are the proot environment variables selecting the loaders,
+// and the name of the loaders installed next to the bundled proot. There is
+// no 32-bit loader on architectures without 32-bit support in proot.
+var prootLoaders = []struct {
+	env  string
+	name string
+}{
+	{"PROOT_LOADER", "proot-loader"},
+	{"PROOT_LOADER_32", "proot-loader-m32"},
+}
+
+// prootLoaderEnv returns the environment selecting the loaders installed
+// next to proot, if any, otherwise proot extracts its own. Proot executes
+// its loader in place of each program, so the kernel records the loader
+// path as the executed path, from which uutils coreutils choose the utility
+// to run: the path is given under /proc for them to use argv[0] instead.
+func prootLoaderEnv(prootPath string) []string {
+	dir, err := filepath.Abs(filepath.Dir(prootPath))
+	if err != nil {
+		return nil
+	}
+	var env []string
+	for _, l := range prootLoaders {
+		loader := filepath.Join(dir, l.name)
+		if fi, err := os.Stat(loader); err == nil && fi.Mode().IsRegular() {
+			env = append(env, l.env+"=/proc/self/root"+loader)
+		}
+	}
+	return env
 }
 
 // removeProotSession removes the session directory, unless a filesystem is
